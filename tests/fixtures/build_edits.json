@@ -161,6 +161,50 @@
         "late/value.h": "#define VALUE 12\n"
       },
       "expected_exit": 25
+    },
+    {
+      "name": "embedded-resource",
+      "write": {
+        "main.c": "#include \"outer.h\"\nconst unsigned char payload[] = {\n#embed \"payload.txt\"\n};\nint main(void) { return value() + payload[0]; }\n",
+        "payload.txt": "A"
+      },
+      "build_ninja": "rule cc\n  command = cc -std=c23 -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -I../source/late -I../source/early -I../source -I. -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nrule generate\n  command = printf '#define GENERATED 5\\n' > $out\nbuild generated.h: generate\nbuild main.o: cc ../source/main.c\nbuild lib.o: cc ../source/lib.c || generated.h\nbuild app: link main.o lib.o\n",
+      "expected_exit": 90
+    },
+    {
+      "name": "embedded-resource-bytes",
+      "write": {
+        "payload.txt": "B"
+      },
+      "preserve_mtime": [
+        "payload.txt"
+      ],
+      "expected_exit": 91,
+      "stale_probe": true
+    },
+    {
+      "name": "embedded-text-is-data",
+      "write": {
+        "payload.txt": "#include \"fake.h\"\n",
+        "fake.h": "#define FAKE 9\n"
+      },
+      "expected_exit": 60
+    },
+    {
+      "name": "missing-embedded-resource",
+      "remove": [
+        "payload.txt"
+      ],
+      "expected_exit": null,
+      "diagnostic_file": "main.c",
+      "stale_probe": true
+    },
+    {
+      "name": "embedded-resource-recovery",
+      "write": {
+        "payload.txt": "C"
+      },
+      "expected_exit": 92
     }
   ]
 }

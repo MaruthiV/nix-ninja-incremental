@@ -25,6 +25,7 @@ struct ActionResult {
 struct Report {
     schema_version: u32,
     mode: &'static str,
+    scanner_package: &'static str,
     directory: PathBuf,
     elapsed_ns: u128,
     actions: Vec<ActionResult>,
@@ -82,7 +83,8 @@ fn measure(path: &Path) -> Result<Report> {
     }
     Ok(Report {
         schema_version: 1,
-        mode: "upstream",
+        mode: "fresh-discovery",
+        scanner_package: env!("CARGO_PKG_NAME"),
         directory,
         elapsed_ns: start.elapsed().as_nanos(),
         actions,

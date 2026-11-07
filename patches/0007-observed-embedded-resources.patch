@@ -1,0 +1,420 @@
+diff --git a/crates/deps-infer/src/c_include_parser.rs b/crates/deps-infer/src/c_include_parser.rs
+index 7203b89..cdc5680 100644
+--- a/crates/deps-infer/src/c_include_parser.rs
++++ b/crates/deps-infer/src/c_include_parser.rs
+@@ -20,4 +20,4 @@ pub fn retrieve_c_includes(
+ ) -> Result<Vec<PathBuf>> {
+-    let includes = gcc_include_parser::parse_include_dirs(cmdline)?;
+-    bfs_parse_includes(files, &includes, virtual_paths, None)
++    let (includes, embeds) = gcc_include_parser::parse_search_dirs(cmdline)?;
++    bfs_parse_includes(files, &includes, &embeds, virtual_paths, None)
+ }
+@@ -30,4 +30,4 @@ pub fn retrieve_c_includes_observed(
+     let recorder = Arc::new(Recorder::new(view));
+-    let includes = gcc_include_parser::parse_include_dirs(cmdline)?;
+-    let result = bfs_parse_includes(files, &includes, None, Some(&recorder))?;
++    let (includes, embeds) = gcc_include_parser::parse_search_dirs(cmdline)?;
++    let result = bfs_parse_includes(files, &includes, &embeds, None, Some(&recorder))?;
+     Ok((result, recorder.trace()))
+@@ -39,2 +39,3 @@ fn bfs_parse_includes(
+     include_dirs: &[PathBuf],
++    embed_dirs: &[PathBuf],
+     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+@@ -43,2 +44,3 @@ fn bfs_parse_includes(
+     let mut visited = HashSet::new();
++    let mut scheduled = HashSet::new();
+     let mut result = Vec::new();
+@@ -50,2 +52,3 @@ fn bfs_parse_includes(
+         if visited.insert(file.clone()) {
++            scheduled.insert(file.clone());
+             queue.push_back(file.clone());
+@@ -64,2 +67,3 @@ fn bfs_parse_includes(
+             include_dirs,
++            embed_dirs,
+             virtual_paths.as_ref(),
+@@ -71,6 +75,13 @@ fn bfs_parse_includes(
+         for source in sources_with_includes {
+-            for include in source.includes {
++            for include in source.dependencies.headers {
+                 if visited.insert(include.clone()) {
+-                    queue.push_back(include.clone());
+-                    result.push(include);
++                    result.push(include.clone());
++                }
++                if scheduled.insert(include.clone()) {
++                    queue.push_back(include);
++                }
++            }
++            for resource in source.dependencies.resources {
++                if visited.insert(resource.clone()) {
++                    result.push(resource);
+                 }
+@@ -89,2 +100,19 @@ pub struct SourceWithIncludes {
+ 
++#[derive(Default)]
++struct Dependencies {
++    headers: Vec<PathBuf>,
++    resources: Vec<PathBuf>,
++}
++
++impl Dependencies {
++    fn all(self) -> Vec<PathBuf> {
++        self.headers.into_iter().chain(self.resources).collect()
++    }
++}
++
++struct ParsedSource {
++    path: PathBuf,
++    dependencies: Dependencies,
++}
++
+ /// Given a list of paths, figure out their dependencies
+@@ -99,3 +127,16 @@ where
+ {
+-    all_sources_with_cache(paths, includes, virtual_paths, &PathCache::default(), None)
++    Ok(all_sources_with_cache(
++        paths,
++        includes,
++        &[],
++        virtual_paths,
++        &PathCache::default(),
++        None,
++    )?
++    .into_iter()
++    .map(|source| SourceWithIncludes {
++        path: source.path,
++        includes: source.dependencies.all(),
++    })
++    .collect())
+ }
+@@ -105,2 +146,3 @@ fn all_sources_with_cache<I, E>(
+     includes: &[PathBuf],
++    embed_dirs: &[PathBuf],
+     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+@@ -108,3 +150,3 @@ fn all_sources_with_cache<I, E>(
+     observer: Option<&Arc<Recorder>>,
+-) -> Result<Vec<SourceWithIncludes>>
++) -> Result<Vec<ParsedSource>>
+ where
+@@ -114,2 +156,3 @@ where
+     let includes = Arc::new(Vec::from(includes));
++    let embed_dirs = Arc::new(Vec::from(embed_dirs));
+     let virtual_paths = Arc::new(virtual_paths.cloned());
+@@ -142,2 +185,3 @@ where
+                 let includes = includes.clone();
++                let embed_dirs = embed_dirs.clone();
+                 let virtual_paths = virtual_paths.clone();
+@@ -146,5 +190,6 @@ where
+                 std::thread::Builder::new().spawn(move || {
+-                    let includes = extract_includes_with_cache(
++                    let dependencies = extract_includes_with_cache(
+                         &path,
+                         &includes,
++                        &embed_dirs,
+                         virtual_paths.as_ref().as_ref(),
+@@ -153,3 +198,3 @@ where
+                     )?;
+-                    Ok(SourceWithIncludes { path, includes })
++                    Ok(ParsedSource { path, dependencies })
+                 })
+@@ -171,3 +216,3 @@ where
+ static INCLUDE_REGEX: LazyLock<Regex> =
+-    LazyLock::new(|| Regex::new(r##"^\s*#\s*include\s*(["<])([^">]*)[">]"##).unwrap());
++    LazyLock::new(|| Regex::new(r##"^\s*#\s*(include|embed)\s*(["<])([^">]*)[">]"##).unwrap());
+ 
+@@ -184,2 +229,3 @@ pub fn extract_includes(
+         include_dirs,
++        &[],
+         virtual_paths,
+@@ -188,2 +234,3 @@ pub fn extract_includes(
+     )
++    .map(Dependencies::all)
+ }
+@@ -193,2 +240,3 @@ fn extract_includes_with_cache(
+     include_dirs: &[PathBuf],
++    embed_dirs: &[PathBuf],
+     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+@@ -196,3 +244,3 @@ fn extract_includes_with_cache(
+     observer: Option<&Arc<Recorder>>,
+-) -> Result<Vec<PathBuf>> {
++) -> Result<Dependencies> {
+     if let Some(observer) = observer {
+@@ -203,2 +251,3 @@ fn extract_includes_with_cache(
+             include_dirs,
++            embed_dirs,
+             virtual_paths,
+@@ -214,2 +263,3 @@ fn extract_includes_with_cache(
+             include_dirs,
++            embed_dirs,
+             virtual_paths,
+@@ -225,2 +275,3 @@ fn extract_from_reader<R: BufRead>(
+     include_dirs: &[PathBuf],
++    embed_dirs: &[PathBuf],
+     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+@@ -228,4 +279,4 @@ fn extract_from_reader<R: BufRead>(
+     observer: Option<&Arc<Recorder>>,
+-) -> Result<Vec<PathBuf>> {
+-    let mut result = Vec::new();
++) -> Result<Dependencies> {
++    let mut result = Dependencies::default();
+     let parent_dir = PathBuf::from(path.parent().unwrap());
+@@ -244,7 +295,9 @@ fn extract_from_reader<R: BufRead>(
+         if let Some(captures) = INCLUDE_REGEX.captures(&line) {
+-            let inc_type = captures.get(1).unwrap().as_str();
+-            let relative_path = PathBuf::from(captures.get(2).unwrap().as_str());
+-
++            let embedded = captures.get(1).unwrap().as_str() == "embed";
++            let inc_type = captures.get(2).unwrap().as_str();
++            let relative_path = PathBuf::from(captures.get(3).unwrap().as_str());
++            let search_dirs = if embedded { embed_dirs } else { include_dirs };
++            let mut resolved = None;
+             if inc_type == "\"" {
+-                if let Some(p) = try_resolve(
++                resolved = try_resolve(
+                     &parent_dir,
+@@ -254,18 +307,23 @@ fn extract_from_reader<R: BufRead>(
+                     observer,
+-                )? {
+-                    result.push(p);
+-                    continue;
++                )?;
++            }
++            if resolved.is_none() {
++                for directory in search_dirs {
++                    resolved = try_resolve(
++                        directory,
++                        &relative_path,
++                        virtual_paths,
++                        path_cache,
++                        observer,
++                    )?;
++                    if resolved.is_some() {
++                        break;
++                    }
+                 }
+             }
+-
+-            for directory in include_dirs {
+-                if let Some(path) = try_resolve(
+-                    directory,
+-                    &relative_path,
+-                    virtual_paths,
+-                    path_cache,
+-                    observer,
+-                )? {
+-                    result.push(path);
+-                    break;
++            if let Some(path) = resolved {
++                if embedded {
++                    result.resources.push(path);
++                } else {
++                    result.headers.push(path);
+                 }
+@@ -477,2 +535,101 @@ mod resolver_tests {
+     }
++
++    #[test]
++    fn embedded_resources_are_leaves() {
++        let fixture = Fixture::new();
++        let source = fixture.write(
++            "main.c",
++            "const unsigned char data[] = {\n#embed \"blob.txt\"\n};\n",
++        );
++        let resource = fixture.write("blob.txt", "#include \"not-a-header.h\"\n");
++        fixture.write("not-a-header.h", "#define VALUE 1\n");
++        assert_eq!(
++            scan("cc -c main.c", &source),
++            HashSet::from([source, resource])
++        );
++    }
++
++    #[test]
++    fn embed_directories_are_ordered_and_separate_from_header_directories() {
++        let fixture = Fixture::new();
++        let source = fixture.write(
++            "main.c",
++            "const unsigned char data[] = {\n#embed <blob.bin>\n};\n",
++        );
++        fixture.write("headers/blob.bin", "wrong header path");
++        let early = fixture.write("early/blob.bin", "first embed path");
++        fixture.write("late/blob.bin", "last embed path");
++        let command = shell_words::join([
++            "cc".to_owned(),
++            format!("-I{}", fixture.path("headers").display()),
++            format!("--embed-dir={}", fixture.path("early").display()),
++            format!("--embed-dir={}", fixture.path("late").display()),
++        ]);
++        assert_eq!(scan(&command, &source), HashSet::from([source, early]));
++    }
++
++    #[test]
++    fn an_embedded_file_can_later_be_a_recursive_header() {
++        let fixture = Fixture::new();
++        let source = fixture.write(
++            "main.c",
++            "const unsigned char data[] = {\n#embed \"both.h\"\n};\n#include \"bridge.h\"\n",
++        );
++        let resource = fixture.write("both.h", "#include \"nested.h\"\n");
++        let bridge = fixture.write("bridge.h", "#include \"both.h\"\n");
++        let nested = fixture.write("nested.h", "#define VALUE 1\n");
++        assert_eq!(
++            scan("cc -c main.c", &source),
++            HashSet::from([source, resource, bridge, nested])
++        );
++    }
++
++    #[test]
++    fn newly_available_embed_is_discovered() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#if __has_embed(\"blob.bin\")\nconst unsigned char data[] = {\n#embed \"blob.bin\"\n};\n#endif\n");
++        assert_eq!(scan("cc", &source), HashSet::from([source.clone()]));
++        let resource = fixture.write("blob.bin", "data");
++        assert_eq!(scan("cc", &source), HashSet::from([source, resource]));
++    }
++
++    #[test]
++    fn embedded_bytes_do_not_control_dependency_discovery() {
++        let fixture = Fixture::new();
++        let source = fixture.write(
++            "main.c",
++            "const unsigned char data[] = {\n#embed \"blob.bin\"\n};\n",
++        );
++        let resource = fixture.write("blob.bin", "first");
++        let view = Arc::new(ReadView::new(&fixture.0, &fixture.0).unwrap());
++        let (paths, trace) =
++            retrieve_c_includes_observed("cc", vec![source.clone()], view).unwrap();
++        assert_eq!(
++            paths.into_iter().collect::<HashSet<_>>(),
++            HashSet::from([source, resource.clone()])
++        );
++        assert!(!trace.files.contains_key(&resource));
++        fixture.write("blob.bin", "#include \"fake.h\"\n");
++        assert!(ReadView::new(&fixture.0, &fixture.0)
++            .unwrap()
++            .validate(&trace)
++            .unwrap());
++    }
++
++    #[test]
++    fn embeds_follow_current_generated_virtual_paths() {
++        let fixture = Fixture::new();
++        let source = fixture.write(
++            "main.c",
++            "const unsigned char data[] = {\n#embed \"generated.bin\"\n};\n",
++        );
++        let logical = fixture.path("generated.bin");
++        let resource = fixture.write("actual.bin", "data");
++        let mapping = HashMap::from([(logical, resource.clone())]);
++        let paths = retrieve_c_includes("cc", vec![source.clone()], Some(mapping)).unwrap();
++        assert_eq!(
++            paths.into_iter().collect::<HashSet<_>>(),
++            HashSet::from([source, resource])
++        );
++    }
+ }
+diff --git a/crates/deps-infer/src/gcc_include_parser.rs b/crates/deps-infer/src/gcc_include_parser.rs
+index 9ab9182..01a7182 100644
+--- a/crates/deps-infer/src/gcc_include_parser.rs
++++ b/crates/deps-infer/src/gcc_include_parser.rs
+@@ -4,3 +4,3 @@ use std::path::PathBuf;
+ /// Parse include directories from a gcc cmdline.
+-pub fn parse_include_dirs(cmdline: &str) -> Result<Vec<PathBuf>> {
++pub fn parse_search_dirs(cmdline: &str) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+     // Split the command line respecting quotes and escapes
+@@ -12,2 +12,3 @@ pub fn parse_include_dirs(cmdline: &str) -> Result<Vec<PathBuf>> {
+     let mut include_dirs = Vec::<PathBuf>::new();
++    let mut embed_dirs = Vec::<PathBuf>::new();
+     let mut i = 0;
+@@ -31,2 +32,5 @@ pub fn parse_include_dirs(cmdline: &str) -> Result<Vec<PathBuf>> {
+ 
++        if let Some(directory) = arg.strip_prefix("--embed-dir=") {
++            embed_dirs.push(PathBuf::from(directory));
++        }
+         i += 1;
+@@ -34,3 +38,3 @@ pub fn parse_include_dirs(cmdline: &str) -> Result<Vec<PathBuf>> {
+ 
+-    Ok(include_dirs)
++    Ok((include_dirs, embed_dirs))
+ }
+@@ -49,3 +53,3 @@ mod tests {
+         assert_eq!(
+-            parse_include_dirs("g++ -Idir1 file.cpp").unwrap(),
++            parse_search_dirs("g++ -Idir1 file.cpp").unwrap().0,
+             paths(&["dir1"])
+@@ -53,3 +57,3 @@ mod tests {
+         assert_eq!(
+-            parse_include_dirs("g++ -I dir2 file.cpp").unwrap(),
++            parse_search_dirs("g++ -I dir2 file.cpp").unwrap().0,
+             paths(&["dir2"])
+@@ -57,3 +61,3 @@ mod tests {
+         assert_eq!(
+-            parse_include_dirs("g++ -I=dir3 file.cpp").unwrap(),
++            parse_search_dirs("g++ -I=dir3 file.cpp").unwrap().0,
+             paths(&["dir3"])
+@@ -65,3 +69,5 @@ mod tests {
+         assert_eq!(
+-            parse_include_dirs("g++ -Idir1 -Idir2 -I dir3 file.cpp").unwrap(),
++            parse_search_dirs("g++ -Idir1 -Idir2 -I dir3 file.cpp")
++                .unwrap()
++                .0,
+             paths(&["dir1", "dir2", "dir3"])
+@@ -73,3 +79,5 @@ mod tests {
+         assert_eq!(
+-            parse_include_dirs("g++ -I\"dir with spaces\" file.cpp").unwrap(),
++            parse_search_dirs("g++ -I\"dir with spaces\" file.cpp")
++                .unwrap()
++                .0,
+             paths(&["dir with spaces"])
+@@ -77,3 +85,5 @@ mod tests {
+         assert_eq!(
+-            parse_include_dirs("g++ -I 'dir with spaces' file.cpp").unwrap(),
++            parse_search_dirs("g++ -I 'dir with spaces' file.cpp")
++                .unwrap()
++                .0,
+             paths(&["dir with spaces"])
+@@ -81,3 +91,5 @@ mod tests {
+         assert_eq!(
+-            parse_include_dirs("g++ -I=dir\\ with\\ spaces file.cpp").unwrap(),
++            parse_search_dirs("g++ -I=dir\\ with\\ spaces file.cpp")
++                .unwrap()
++                .0,
+             paths(&["dir with spaces"])
+@@ -89,3 +101,3 @@ mod tests {
+         assert_eq!(
+-            parse_include_dirs("g++ -I   dir4 file.cpp").unwrap(),
++            parse_search_dirs("g++ -I   dir4 file.cpp").unwrap().0,
+             paths(&["dir4"])
+@@ -97,3 +109,5 @@ mod tests {
+         assert_eq!(
+-            parse_include_dirs("g++ -Wall -Wextra -O2 -Idir1 -I dir2 -I=dir3 -c file.cpp").unwrap(),
++            parse_search_dirs("g++ -Wall -Wextra -O2 -Idir1 -I dir2 -I=dir3 -c file.cpp")
++                .unwrap()
++                .0,
+             paths(&["dir1", "dir2", "dir3"])
+@@ -105,3 +119,5 @@ mod tests {
+         assert_eq!(
+-            parse_include_dirs("g++ -I/usr/include -I /opt/include file.cpp").unwrap(),
++            parse_search_dirs("g++ -I/usr/include -I /opt/include file.cpp")
++                .unwrap()
++                .0,
+             paths(&["/usr/include", "/opt/include"])
+@@ -113,3 +129,5 @@ mod tests {
+         assert_eq!(
+-            parse_include_dirs("g++ -I../include -I ./local/include file.cpp").unwrap(),
++            parse_search_dirs("g++ -I../include -I ./local/include file.cpp")
++                .unwrap()
++                .0,
+             paths(&["../include", "./local/include"])
+@@ -121,4 +139,5 @@ mod tests {
+         assert_eq!(
+-            parse_include_dirs("g++ -I/path/to/my-includes -I=/path/to/your_includes file.cpp")
+-                .unwrap(),
++            parse_search_dirs("g++ -I/path/to/my-includes -I=/path/to/your_includes file.cpp")
++                .unwrap()
++                .0,
+             paths(&["/path/to/my-includes", "/path/to/your_includes"])
+@@ -130,3 +149,3 @@ mod tests {
+         // Test with unmatched quotes
+-        assert!(parse_include_dirs("g++ -I\"unclosed quote file.cpp").is_err());
++        assert!(parse_search_dirs("g++ -I\"unclosed quote file.cpp").is_err());
+     }

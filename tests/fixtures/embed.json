@@ -1,0 +1,110 @@
+[
+  {
+    "name": "embed-leaf",
+    "files": {
+      "main.c": "const unsigned char data[] = {\n#embed \"blob.txt\"\n};\nint value(void) { return data[0]; }\n",
+      "blob.txt": "#include \"fake.h\"\n",
+      "fake.h": "#define VALUE 1\n"
+    },
+    "expected_dependencies": [
+      "main.c",
+      "blob.txt"
+    ],
+    "flags": [
+      "-std=c23"
+    ]
+  },
+  {
+    "name": "embed-quote-precedence",
+    "flags": [
+      "-std=c23",
+      "--embed-dir=other"
+    ],
+    "files": {
+      "main.c": "const unsigned char data[] = {\n#embed \"blob.txt\"\n};\nint value(void) { return data[0]; }\n",
+      "blob.txt": "A",
+      "other/blob.txt": "B"
+    },
+    "expected_dependencies": [
+      "main.c",
+      "blob.txt"
+    ]
+  },
+  {
+    "name": "embed-search-order",
+    "flags": [
+      "-std=c23",
+      "-Iheaders",
+      "--embed-dir=first",
+      "--embed-dir=second"
+    ],
+    "files": {
+      "main.c": "const unsigned char data[] = {\n#embed <blob.txt>\n};\nint value(void) { return data[0]; }\n",
+      "headers/blob.txt": "H",
+      "first/blob.txt": "F",
+      "second/blob.txt": "S"
+    },
+    "expected_dependencies": [
+      "main.c",
+      "first/blob.txt"
+    ]
+  },
+  {
+    "name": "embed-header-path-is-not-an-embed-path",
+    "flags": [
+      "-std=c23",
+      "-Iheaders"
+    ],
+    "files": {
+      "main.c": "#if __has_embed(<blob.txt>)\nconst unsigned char data[] = {\n#embed <blob.txt>\n};\n#endif\nint value(void) { return 0; }\n",
+      "headers/blob.txt": "H"
+    },
+    "expected_dependencies": [
+      "main.c"
+    ]
+  },
+  {
+    "name": "embed-and-include-same-file",
+    "files": {
+      "main.c": "const unsigned char data[] = {\n#embed \"both.h\"\n};\n#include \"bridge.h\"\nint value(void) { return VALUE; }\n",
+      "both.h": "#include \"nested.h\"\n",
+      "bridge.h": "#include \"both.h\"\n",
+      "nested.h": "#define VALUE 7\n"
+    },
+    "expected_dependencies": [
+      "main.c",
+      "both.h",
+      "bridge.h",
+      "nested.h"
+    ],
+    "flags": [
+      "-std=c23"
+    ]
+  },
+  {
+    "name": "embed-optional-missing",
+    "files": {
+      "main.c": "#if __has_embed(\"optional.txt\")\nconst unsigned char data[] = {\n#embed \"optional.txt\"\n};\n#endif\nint value(void) { return 0; }\n"
+    },
+    "expected_dependencies": [
+      "main.c"
+    ],
+    "flags": [
+      "-std=c23"
+    ]
+  },
+  {
+    "name": "embed-optional-present",
+    "files": {
+      "main.c": "#if __has_embed(\"optional.txt\")\nconst unsigned char data[] = {\n#embed \"optional.txt\"\n};\n#endif\nint value(void) { return 0; }\n",
+      "optional.txt": "A"
+    },
+    "expected_dependencies": [
+      "main.c",
+      "optional.txt"
+    ],
+    "flags": [
+      "-std=c23"
+    ]
+  }
+]
