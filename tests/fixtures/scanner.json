@@ -93,5 +93,22 @@
     "expected_dependencies": ["main.c", "value.h"],
     "expected_missing": ["value.h"],
     "baseline_limitation": "upstream scanner does not recognize the hash digraph"
+  },
+  {
+    "name": "carriage-return-directives",
+    "files": {
+      "main.c": "#include \"one.h\"\r#include \"two.h\"\rint value(void) { return ONE + TWO; }\r",
+      "one.h": "#define ONE 3\n",
+      "two.h": "#define TWO 4\n"
+    },
+    "expected_dependencies": [
+      "main.c",
+      "one.h",
+      "two.h"
+    ],
+    "expected_missing": [
+      "two.h"
+    ],
+    "baseline_limitation": "upstream scanner does not split bare carriage-return lines"
   }
 ]

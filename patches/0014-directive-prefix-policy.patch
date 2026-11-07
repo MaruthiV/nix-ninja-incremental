@@ -1,0 +1,141 @@
+diff --git a/crates/nix-ninja/src/discovery_policy.rs b/crates/nix-ninja/src/discovery_policy.rs
+index 899d0f6..2ad4cea 100644
+--- a/crates/nix-ninja/src/discovery_policy.rs
++++ b/crates/nix-ninja/src/discovery_policy.rs
+@@ -225,6 +225,15 @@ static FEATURE_CHECK: LazyLock<Regex> = LazyLock::new(|| {
+         .unwrap()
+ });
+ 
++fn directive_prefix(prefix: &str) -> bool {
++    prefix.trim().is_empty() || prefix.contains("/*") || prefix.contains("*/")
++}
++
++fn directive_digraph(line: &str) -> bool {
++    line.match_indices("%:")
++        .any(|(index, _)| directive_prefix(&line[..index]))
++}
++
+ fn continued_dependency(text: &str) -> bool {
+     let mut joined = String::new();
+     let mut active = false;
+@@ -254,7 +263,10 @@ fn continued_dependency(text: &str) -> bool {
+             } else {
+                 joined.as_str().into()
+             };
+-            if dependency || searches.contains("__has_include") || searches.contains("__has_embed")
++            if dependency
++                || directive_digraph(&joined)
++                || searches.contains("__has_include")
++                || searches.contains("__has_embed")
+             {
+                 return true;
+             }
+@@ -267,10 +279,21 @@ fn continued_dependency(text: &str) -> bool {
+ 
+ fn source(bytes: &[u8]) -> Check<()> {
+     let text = std::str::from_utf8(bytes).map_err(|_| "non-utf8-source")?;
++    if bytes
++        .iter()
++        .enumerate()
++        .any(|(index, byte)| *byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'))
++    {
++        return Err("unsupported-line-ending");
++    }
+     if continued_dependency(text) {
+         return Err("continued-dependency");
+     }
+-    if text.contains("??") || text.contains("%:") {
++    if bytes
++        .windows(3)
++        .any(|part| part.starts_with(b"??") && b"()<>/='!-".contains(&part[2]))
++        || text.lines().any(directive_digraph)
++    {
+         return Err("unmodeled-source-transform");
+     }
+     if text.contains("__has_include_next") {
+@@ -278,6 +301,9 @@ fn source(bytes: &[u8]) -> Check<()> {
+     }
+     let mut literals = HashSet::new();
+     for line in text.lines() {
++        if unmodeled_directive(line) {
++            return Err("unmodeled-directive-spelling");
++        }
+         let directive = DIRECTIVE.captures(line);
+         if let Some(directive) = directive {
+             match directive.get(1).unwrap().as_str() {
+@@ -300,8 +326,6 @@ fn source(bytes: &[u8]) -> Check<()> {
+                 "pragma" if line.contains("pch") => return Err("unsupported-preprocessor-mode"),
+                 _ => {}
+             }
+-        } else if unmodeled_directive(line) {
+-            return Err("unmodeled-directive-spelling");
+         }
+     }
+     let queries: Vec<_> = QUERY.captures_iter(text).collect();
+@@ -325,15 +349,18 @@ fn source(bytes: &[u8]) -> Check<()> {
+ }
+ 
+ fn unmodeled_directive(line: &str) -> bool {
+-    let Some((prefix, _)) = line.split_once('#') else {
+-        return false;
+-    };
+-    if prefix.trim_start().starts_with('*') && !line.contains("*/") {
+-        return false;
+-    }
+-    ["include", "embed", "import"]
+-        .iter()
+-        .any(|word| line.contains(word))
++    line.match_indices('#').any(|(index, _)| {
++        let prefix = &line[..index];
++        if (prefix.trim().is_empty() && DIRECTIVE.is_match(&line[index..]))
++            || (prefix.trim_start().starts_with('*') && !line.contains("*/"))
++        {
++            return false;
++        }
++        directive_prefix(prefix)
++            && ["include", "embed", "import"]
++                .iter()
++                .any(|word| line[index..].contains(word))
++    })
+ }
+ 
+ #[derive(Default)]
+@@ -577,6 +604,38 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn ordinary_text_is_not_a_dependency_directive() {
++        for text in [
++            "const char *pattern = \"%1%: %2%\";\n",
++            "const char *question = \"why???\";\n",
++            "{{#include experimental-features-shortlist.md}}\n",
++            "https://example.invalid/include/header.h#L42\n",
++        ] {
++            assert!(source(text.as_bytes()).is_ok(), "{text}");
++        }
++        assert!(source(b"#include \"value.h\"\r\n").is_ok());
++        for suffix in b"()<>/='!-" {
++            assert_eq!(
++                source(&[b'?', b'?', *suffix]),
++                Err("unmodeled-source-transform")
++            );
++        }
++    }
++
++    #[test]
++    fn directives_after_comment_closures_and_spliced_digraphs_bypass() {
++        for text in [
++            "/* comment */ %:include \"value.h\"\n",
++            "/*\n# example */ #include \"value.h\"\n",
++            "%\\\n:include \"value.h\"\n",
++            "/*\n# example *\\\n/ %\\\n:include \"value.h\"\n",
++            "#include \"one.h\"\r#include \"two.h\"\r",
++        ] {
++            assert!(source(text.as_bytes()).is_err(), "{text}");
++        }
++    }
++
+     #[test]
+     fn failure_examples_are_bounded_and_sorted() {
+         let fixture = Fixture::new();
