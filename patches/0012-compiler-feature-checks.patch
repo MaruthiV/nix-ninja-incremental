@@ -1,0 +1,97 @@
+diff --git a/crates/nix-ninja/src/discovery_policy.rs b/crates/nix-ninja/src/discovery_policy.rs
+index 1ef7d37..835121a 100644
+--- a/crates/nix-ninja/src/discovery_policy.rs
++++ b/crates/nix-ninja/src/discovery_policy.rs
+@@ -216,6 +216,10 @@ static QUERY: LazyLock<Regex> = LazyLock::new(|| {
+ });
+ static QUERY_START: LazyLock<Regex> =
+     LazyLock::new(|| Regex::new(r"__has_(include|embed)\s*\(").unwrap());
++static FEATURE_CHECK: LazyLock<Regex> = LazyLock::new(|| {
++    Regex::new(r"\bdefined\s*(?:\(\s*__has_(?:include|embed)\s*\)|\s+__has_(?:include|embed)\b)")
++        .unwrap()
++});
+ 
+ fn continued_dependency(text: &str) -> bool {
+     let mut joined = String::new();
+@@ -238,7 +242,16 @@ fn continued_dependency(text: &str) -> bool {
+                         )
+                     })
+             });
+-            if dependency || joined.contains("__has_include") || joined.contains("__has_embed") {
++            let condition = DIRECTIVE
++                .captures(&joined)
++                .is_some_and(|directive| matches!(&directive[1], "if" | "elif"));
++            let searches = if condition {
++                FEATURE_CHECK.replace_all(&joined, "")
++            } else {
++                joined.as_str().into()
++            };
++            if dependency || searches.contains("__has_include") || searches.contains("__has_embed")
++            {
+                 return true;
+             }
+             joined.clear();
+@@ -318,14 +331,17 @@ pub struct FilePolicy {
+ 
+ impl FilePolicy {
+     pub fn trace(&mut self, view: &ReadView, trace: &DiscoveryTrace) -> Check<()> {
++        let mut result = Ok(());
+         for path in trace.files.keys() {
+             let checked = self.checked.entry(path.clone()).or_insert_with(|| {
+                 let bytes = view.bytes(path).map_err(|_| "unobservable-source")?;
+                 source(&bytes)
+             });
+-            (*checked)?;
++            if result.is_ok() {
++                result = *checked;
++            }
+         }
+-        Ok(())
++        result
+     }
+ 
+     pub fn failures(&self) -> BTreeMap<String, &'static str> {
+@@ -497,6 +513,7 @@ mod tests {
+             "#if __has_\\\ninclude(\"value.h\")\n#endif\n",
+             "#if __ha\\\ns_embed(\"value.bin\")\n#endif\n",
+             "#define QUERY(x) __has_\\\ninclude(x)\n",
++            "#define QUERY __has_\\\ninclude\n#if QUERY(\"probe.h\")\n#endif\n",
+         ] {
+             assert_eq!(
+                 source(text.as_bytes()),
+@@ -549,11 +566,8 @@ mod tests {
+             .collect::<Vec<_>>();
+         let view = Arc::new(ReadView::new(&fixture.0, &fixture.0).unwrap());
+         let mut policy = FilePolicy::default();
+-        for path in files {
+-            let (_, trace) =
+-                retrieve_c_dependency_paths_observed("cc", vec![path], view.clone()).unwrap();
+-            assert!(policy.trace(&view, &trace).is_err());
+-        }
++        let (_, trace) = retrieve_c_dependency_paths_observed("cc", files, view.clone()).unwrap();
++        assert!(policy.trace(&view, &trace).is_err());
+         let examples = policy.failures();
+         assert_eq!(examples.len(), 32);
+         assert!(examples.keys().next().unwrap().ends_with("header-00.h"));
+@@ -563,6 +577,21 @@ mod tests {
+             .all(|reason| *reason == "computed-dependency"));
+     }
+ 
++    #[test]
++    fn compiler_feature_checks_are_not_file_queries() {
++        assert!(source(
++            concat!(
++                "#if defined(FEATURE) \\\n",
++                "    && defined(__has_include)\n",
++                "# if __has_include(<cet.h>)\n",
++                "#  include <cet.h>\n",
++                "# endif\n#endif\n"
++            )
++            .as_bytes()
++        )
++        .is_ok());
++    }
++
+     #[test]
+     fn mutable_system_paths_and_ambient_search_are_rejected() {
+         let fixture = Fixture::new();
