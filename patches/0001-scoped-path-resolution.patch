@@ -1,0 +1,294 @@
+diff --git a/crates/deps-infer/src/c_include_parser.rs b/crates/deps-infer/src/c_include_parser.rs
+index 4e57a78..c30d3da 100644
+--- a/crates/deps-infer/src/c_include_parser.rs
++++ b/crates/deps-infer/src/c_include_parser.rs
+@@ -30,6 +30,7 @@ fn bfs_parse_includes(
+     let mut visited = HashSet::new();
+     let mut result = Vec::new();
+     let mut queue = VecDeque::new();
++    let path_cache = PathCache::default();
+ 
+     // Initialize queue with starting files
+     for file in files {
+@@ -45,10 +46,11 @@ fn bfs_parse_includes(
+         let current_batch: Vec<PathBuf> = queue.drain(..).collect();
+ 
+         // Process all files in the current batch in parallel
+-        let sources_with_includes = all_sources_and_includes(
++        let sources_with_includes = all_sources_with_cache(
+             current_batch.into_iter().map(Ok::<_, std::io::Error>),
+             include_dirs,
+             virtual_paths.as_ref(),
++            &path_cache,
+         )?;
+ 
+         // Process each source's includes
+@@ -77,6 +79,19 @@ pub fn all_sources_and_includes<I, E>(
+     includes: &[PathBuf],
+     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+ ) -> Result<Vec<SourceWithIncludes>>
++where
++    I: Iterator<Item = Result<PathBuf, E>>,
++    E: Debug,
++{
++    all_sources_with_cache(paths, includes, virtual_paths, &PathCache::default())
++}
++
++fn all_sources_with_cache<I, E>(
++    paths: I,
++    includes: &[PathBuf],
++    virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
++    path_cache: &PathCache,
++) -> Result<Vec<SourceWithIncludes>>
+ where
+     I: Iterator<Item = Result<PathBuf, E>>,
+     E: Debug,
+@@ -87,20 +102,27 @@ where
+ 
+     for entry in paths {
+         let path = match entry {
+-            Ok(value) => canonicalize_cached(value.clone(), virtual_paths.as_ref().as_ref())
+-                .map_err(|e| anyhow!("{:?}", e))?
+-                .ok_or(anyhow!(
+-                    "Required file not found {}",
+-                    value.to_string_lossy()
+-                ))?,
++            Ok(value) => {
++                canonicalize_with_cache(value.clone(), virtual_paths.as_ref().as_ref(), path_cache)
++                    .map_err(|e| anyhow!("{:?}", e))?
++                    .ok_or(anyhow!(
++                        "Required file not found {}",
++                        value.to_string_lossy()
++                    ))?
++            }
+             Err(e) => return Err(anyhow!("{:?}", e)),
+         };
+         let includes = includes.clone();
+         let virtual_paths = virtual_paths.clone();
++        let path_cache = path_cache.clone();
+ 
+         handles.push(std::thread::spawn(move || {
+-            let includes = match extract_includes(&path, &includes, virtual_paths.as_ref().as_ref())
+-            {
++            let includes = match extract_includes_with_cache(
++                &path,
++                &includes,
++                virtual_paths.as_ref().as_ref(),
++                &path_cache,
++            ) {
+                 Ok(value) => value,
+                 Err(e) => {
+                     return Err(e);
+@@ -130,6 +152,15 @@ pub fn extract_includes(
+     path: &PathBuf,
+     include_dirs: &[PathBuf],
+     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
++) -> Result<Vec<PathBuf>> {
++    extract_includes_with_cache(path, include_dirs, virtual_paths, &PathCache::default())
++}
++
++fn extract_includes_with_cache(
++    path: &PathBuf,
++    include_dirs: &[PathBuf],
++    virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
++    path_cache: &PathCache,
+ ) -> Result<Vec<PathBuf>> {
+     let f =
+         File::open(path).map_err(|e| anyhow!("Failed to open file {}: {}", path.display(), e))?;
+@@ -153,7 +184,8 @@ pub fn extract_includes(
+             let relative_path = PathBuf::from(captures.get(2).unwrap().as_str());
+ 
+             if inc_type == "\"" {
+-                if let Some(p) = try_resolve(&parent_dir, &relative_path, virtual_paths) {
++                if let Some(p) = try_resolve(&parent_dir, &relative_path, virtual_paths, path_cache)
++                {
+                     result.push(p);
+                     continue;
+                 }
+@@ -161,7 +193,7 @@ pub fn extract_includes(
+ 
+             if let Some(p) = include_dirs
+                 .iter()
+-                .find_map(|i| try_resolve(i, &relative_path, virtual_paths))
++                .find_map(|i| try_resolve(i, &relative_path, virtual_paths, path_cache))
+             {
+                 result.push(p);
+             }
+@@ -175,17 +207,30 @@ fn try_resolve(
+     head: &Path,
+     tail: &Path,
+     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
++    path_cache: &PathCache,
+ ) -> Option<PathBuf> {
+-    canonicalize_cached(head.join(tail), virtual_paths).ok()?
++    canonicalize_with_cache(head.join(tail), virtual_paths, path_cache).ok()?
+ }
+ 
+ type PathCache = Arc<RwLock<HashMap<PathBuf, Option<PathBuf>>>>;
+-static PATH_CACHE: LazyLock<PathCache> = LazyLock::new(Default::default);
+ 
+ pub fn canonicalize_cached<P>(
+     path: P,
+     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+ ) -> Result<Option<PathBuf>, std::io::Error>
++where
++    P: AsRef<Path>,
++    PathBuf: Borrow<P>,
++    P: Hash + Eq,
++{
++    canonicalize_with_cache(path, virtual_paths, &PathCache::default())
++}
++
++fn canonicalize_with_cache<P>(
++    path: P,
++    virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
++    path_cache: &PathCache,
++) -> Result<Option<PathBuf>, std::io::Error>
+ where
+     P: AsRef<Path>,
+     PathBuf: Borrow<P>,
+@@ -202,7 +247,7 @@ where
+ 
+     {
+         // Then try the cache.
+-        let cache = PATH_CACHE.read().unwrap();
++        let cache = path_cache.read().unwrap();
+         if let Some(cached) = cache.get(&path) {
+             return Ok(cached.clone());
+         }
+@@ -215,8 +260,134 @@ where
+         None
+     };
+ 
+-    let mut cache = PATH_CACHE.write().unwrap();
++    let mut cache = path_cache.write().unwrap();
+     cache.insert(path.as_ref().to_path_buf(), result.clone());
+ 
+     Ok(result)
+ }
++
++#[cfg(test)]
++mod resolver_tests {
++    use super::*;
++    use std::fs;
++    use std::sync::atomic::{AtomicU64, Ordering};
++
++    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
++
++    struct Fixture(PathBuf);
++
++    impl Fixture {
++        fn new() -> Self {
++            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
++            let root =
++                std::env::temp_dir().join(format!("nix-ninja-paths-{}-{id}", std::process::id()));
++            fs::create_dir(&root).unwrap();
++            Self(root.canonicalize().unwrap())
++        }
++
++        fn path(&self, name: &str) -> PathBuf {
++            self.0.join(name)
++        }
++
++        fn write(&self, name: &str, contents: &str) -> PathBuf {
++            let path = self.path(name);
++            fs::create_dir_all(path.parent().unwrap()).unwrap();
++            fs::write(&path, contents).unwrap();
++            path
++        }
++    }
++
++    impl Drop for Fixture {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.0);
++        }
++    }
++
++    fn scan(command: &str, source: &Path) -> HashSet<PathBuf> {
++        retrieve_c_includes(command, vec![source.to_owned()], None)
++            .unwrap()
++            .into_iter()
++            .collect()
++    }
++
++    #[test]
++    fn new_header_is_seen_by_next_scan() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#include \"value.h\"\n");
++        assert_eq!(
++            scan("cc -c main.c", &source),
++            HashSet::from([source.clone()])
++        );
++        let header = fixture.write("value.h", "#define VALUE 1\n");
++        assert_eq!(
++            scan("cc -c main.c", &source),
++            HashSet::from([source, header])
++        );
++    }
++
++    #[test]
++    fn earlier_include_directory_is_checked_again() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#include <value.h>\n");
++        fs::create_dir(fixture.path("early")).unwrap();
++        let late = fixture.write("late/value.h", "#define VALUE 1\n");
++        let command = shell_words::join([
++            "cc".to_owned(),
++            format!("-I{}", fixture.path("early").display()),
++            format!("-I{}", fixture.path("late").display()),
++        ]);
++        assert_eq!(
++            scan(&command, &source),
++            HashSet::from([source.clone(), late])
++        );
++        let early = fixture.write("early/value.h", "#define VALUE 2\n");
++        assert_eq!(scan(&command, &source), HashSet::from([source, early]));
++    }
++
++    #[test]
++    fn removed_header_is_not_retained() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#include \"value.h\"\n");
++        let header = fixture.write("value.h", "#define VALUE 1\n");
++        assert_eq!(
++            scan("cc -c main.c", &source),
++            HashSet::from([source.clone(), header.clone()])
++        );
++        fs::remove_file(header).unwrap();
++        assert_eq!(scan("cc -c main.c", &source), HashSet::from([source]));
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn symlink_target_is_resolved_again() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#include \"value.h\"\n");
++        let old = fixture.write("old.h", "#define VALUE 1\n");
++        let new = fixture.write("new.h", "#define VALUE 2\n");
++        let link = fixture.path("value.h");
++        std::os::unix::fs::symlink(&old, &link).unwrap();
++        assert_eq!(
++            scan("cc -c main.c", &source),
++            HashSet::from([source.clone(), old])
++        );
++        fs::remove_file(&link).unwrap();
++        std::os::unix::fs::symlink(&new, &link).unwrap();
++        assert_eq!(scan("cc -c main.c", &source), HashSet::from([source, new]));
++    }
++
++    #[test]
++    fn virtual_paths_take_precedence() {
++        let fixture = Fixture::new();
++        let logical = fixture.path("missing.h");
++        assert_eq!(canonicalize_cached(logical.clone(), None).unwrap(), None);
++        let old = fixture.write("old.h", "#define VALUE 1\n");
++        let new = fixture.write("new.h", "#define VALUE 2\n");
++        for actual in [old, new] {
++            let mapping = HashMap::from([(logical.clone(), actual.clone())]);
++            assert_eq!(
++                canonicalize_cached(logical.clone(), Some(&mapping)).unwrap(),
++                Some(actual)
++            );
++        }
++    }
++}

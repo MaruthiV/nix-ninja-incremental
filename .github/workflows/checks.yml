@@ -30,3 +30,31 @@ jobs:
         run: python3 tools/oracle.py --scanner .work/target/release/nni-scanner-bench --output results/ci/scanner.json
       - name: Path observation diagnostics
         run: cargo +1.95.0 run --locked --release --manifest-path benchmarks/scanner/Cargo.toml --example path_cache
+
+  patch-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [resolver, profile]
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.work/target-patches
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Pinned patch variant
+        run: python3 tools/variants.py prepare ${{ matrix.variant }}
+      - name: Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt
+      - name: Formatting
+        run: cargo +1.95.0 fmt --all --manifest-path .work/nix-ninja-${{ matrix.variant }}/Cargo.toml --check
+      - name: Compiler checks
+        run: cargo +1.95.0 clippy --locked --workspace --all-targets --manifest-path .work/nix-ninja-${{ matrix.variant }}/Cargo.toml -- -D warnings
+      - name: Workspace tests
+        run: cargo +1.95.0 test --locked --workspace --manifest-path .work/nix-ninja-${{ matrix.variant }}/Cargo.toml
+      - name: Profiling binary
+        if: matrix.variant == 'profile'
+        run: cargo +1.95.0 build --locked --manifest-path .work/nix-ninja-profile/Cargo.toml -p nix-ninja
+      - name: Profile input isolation and failures
+        if: matrix.variant == 'profile'
+        run: python3 tests/profile_checks.py --binary .work/target-patches/debug/nix-ninja
