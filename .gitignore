@@ -2,7 +2,7 @@
 /AGENTS.md
 /.work/
 /results/
-/target/
+target/
 /.venv/
 __pycache__/
 *.pyc
