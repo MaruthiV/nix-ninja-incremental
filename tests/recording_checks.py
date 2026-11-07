@@ -37,7 +37,7 @@ def main():
               "binary": str(binary), "binary_sha256": build_oracle.digest(binary), "fixtures": []}
     print(destination, flush=True)
     try:
-        for name in ["build_edits.json", "alias_build_edits.json"]:
+        for name in ["build_edits.json", "alias_build_edits.json", "presence_build_edits.json"]:
             fixture = ROOT / "tests/fixtures" / name
             results = {}
             for mode in ["off", "record"]:

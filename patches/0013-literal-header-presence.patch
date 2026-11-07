@@ -1,0 +1,392 @@
+diff --git a/crates/deps-infer/src/c_include_parser.rs b/crates/deps-infer/src/c_include_parser.rs
+index 7c0c2ab..132f333 100644
+--- a/crates/deps-infer/src/c_include_parser.rs
++++ b/crates/deps-infer/src/c_include_parser.rs
+@@ -267,6 +267,8 @@ where
+ 
+ static INCLUDE_REGEX: LazyLock<Regex> =
+     LazyLock::new(|| Regex::new(r##"^\s*#\s*(include|embed)\s*(["<])([^">]*)[">]"##).unwrap());
++static PRESENCE_REGEX: LazyLock<Regex> =
++    LazyLock::new(|| Regex::new(r##"\b__has_(include)\s*\(\s*(["<])([^">]+)[">]\s*\)"##).unwrap());
+ 
+ /// Given a C-like source, try to resolve includes.
+ ///
+@@ -350,37 +352,57 @@ fn extract_from_reader<R: BufRead>(
+             }
+         };
+ 
+-        if let Some(captures) = INCLUDE_REGEX.captures(&line) {
++        for (captures, presence) in INCLUDE_REGEX
++            .captures_iter(&line)
++            .map(|captures| (captures, false))
++            .chain(
++                PRESENCE_REGEX
++                    .captures_iter(&line)
++                    .map(|captures| (captures, true)),
++            )
++        {
+             let embedded = captures.get(1).unwrap().as_str() == "embed";
+             let inc_type = captures.get(2).unwrap().as_str();
+             let relative_path = PathBuf::from(captures.get(3).unwrap().as_str());
+             let search_dirs = if embedded { embed_dirs } else { include_dirs };
+-            let mut resolved = None;
+-            if inc_type == "\"" {
+-                resolved = try_resolve(
+-                    &parent_dir,
++            let resolve = |directory: &Path| -> Result<Option<PathBuf>> {
++                let Some(candidate) = try_resolve(
++                    directory,
+                     &relative_path,
+                     virtual_paths,
+                     path_cache,
+                     observer,
+-                )?;
++                )?
++                else {
++                    return Ok(None);
++                };
++                if presence {
++                    let regular = if let Some(observer) = observer {
++                        observer.is_file(&candidate)?
++                    } else {
++                        canonicalize_with_cache(candidate.clone(), virtual_paths, path_cache, None)?
++                            .is_some_and(|target| target.is_file())
++                    };
++                    if !regular {
++                        return Ok(None);
++                    }
++                }
++                Ok(Some(candidate))
++            };
++            let mut resolved = None;
++            if inc_type == "\"" {
++                resolved = resolve(&parent_dir)?;
+             }
+             if resolved.is_none() {
+                 for directory in search_dirs {
+-                    resolved = try_resolve(
+-                        directory,
+-                        &relative_path,
+-                        virtual_paths,
+-                        path_cache,
+-                        observer,
+-                    )?;
++                    resolved = resolve(directory)?;
+                     if resolved.is_some() {
+                         break;
+                     }
+                 }
+             }
+             if let Some(path) = resolved {
+-                if embedded {
++                if embedded || presence {
+                     result.resources.push(path);
+                 } else {
+                     result.headers.push(path);
+@@ -816,6 +838,112 @@ mod resolver_tests {
+             .unwrap());
+     }
+ 
++    #[test]
++    fn presence_queries_are_leaf_inputs_with_negative_searches() {
++        let fixture = Fixture::new();
++        let source = fixture.write(
++            "main.c",
++            "#if __has_include(\"present.h\") && __has_include(<angle.h>) && __has_include(<missing.h>)\n#endif\n",
++        );
++        let marker = fixture.write("present.h", "#include \"fake.h\"\n");
++        let angle = fixture.write("headers/angle.h", "not c");
++        fixture.write("fake.h", "int fake;\n");
++        let command = format!("cc -I{}", fixture.path("headers").display());
++        let (paths, trace) = retrieve_c_dependency_paths_observed(
++            &command,
++            vec![source.clone()],
++            Arc::new(ReadView::new(&fixture.0, &fixture.0).unwrap()),
++        )
++        .unwrap();
++        assert_eq!(
++            HashSet::from_iter(paths),
++            HashSet::from([source, marker.clone(), angle.clone()])
++        );
++        assert!(!trace.files.contains_key(&marker));
++        assert!(trace.resolutions.contains_key(&marker));
++        assert!(trace.resolutions.contains_key(&angle));
++        assert_eq!(
++            trace.resolutions.get(&fixture.path("headers/missing.h")),
++            Some(&None)
++        );
++        fixture.write("present.h", "different non-c data");
++        assert!(ReadView::new(&fixture.0, &fixture.0)
++            .unwrap()
++            .validate(&trace)
++            .unwrap());
++    }
++
++    #[test]
++    fn presence_search_skips_directories_and_tracks_earlier_absence() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#if __has_include(<marker.h>)\n#endif\n");
++        fs::create_dir_all(fixture.path("early/marker.h")).unwrap();
++        let marker = fixture.write("late/marker.h", "not c");
++        let command = shell_words::join([
++            "cc".to_owned(),
++            format!("-I{}", fixture.path("early").display()),
++            format!("-I{}", fixture.path("late").display()),
++        ]);
++        assert_eq!(
++            scan(&command, &source),
++            HashSet::from([source.clone(), marker])
++        );
++        fs::remove_dir(fixture.path("early/marker.h")).unwrap();
++        let (_, trace) = retrieve_c_dependency_paths_observed(
++            &command,
++            vec![source.clone()],
++            Arc::new(ReadView::new(&fixture.0, &fixture.0).unwrap()),
++        )
++        .unwrap();
++        assert_eq!(
++            trace.resolutions.get(&fixture.path("early/marker.h")),
++            Some(&None)
++        );
++        let early = fixture.write("early/marker.h", "earlier");
++        assert!(!ReadView::new(&fixture.0, &fixture.0)
++            .unwrap()
++            .validate(&trace)
++            .unwrap());
++        assert_eq!(scan(&command, &source), HashSet::from([source, early]));
++    }
++
++    #[test]
++    fn presence_queries_do_not_block_later_recursive_includes() {
++        let fixture = Fixture::new();
++        let source = fixture.write(
++            "main.c",
++            "#if __has_include(\"both.h\")\n#endif\n#include \"bridge.h\"\n",
++        );
++        let both = fixture.write("both.h", "#include \"nested.h\"\n");
++        let bridge = fixture.write("bridge.h", "#include \"both.h\"\n");
++        let nested = fixture.write("nested.h", "int value;\n");
++        assert_eq!(
++            scan("cc", &source),
++            HashSet::from([source, both, bridge, nested])
++        );
++    }
++
++    #[test]
++    fn presence_queries_use_current_virtual_paths() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#if __has_include(\"generated.h\")\n#endif\n");
++        let logical = fixture.path("generated.h");
++        let marker = fixture.write("actual.h", "not c");
++        let mapping = HashMap::from([(logical.clone(), marker.clone())]);
++        assert_eq!(
++            HashSet::from_iter(
++                retrieve_c_includes("cc", vec![source.clone()], Some(mapping.clone())).unwrap()
++            ),
++            HashSet::from([source.clone(), marker])
++        );
++        assert_eq!(
++            HashSet::from_iter(
++                retrieve_c_dependency_paths("cc", vec![source.clone()], Some(mapping)).unwrap()
++            ),
++            HashSet::from([source, logical])
++        );
++    }
++
+     #[test]
+     fn embeds_follow_current_generated_virtual_paths() {
+         let fixture = Fixture::new();
+diff --git a/crates/deps-infer/src/observations.rs b/crates/deps-infer/src/observations.rs
+index 7f172bb..9d6f3e8 100644
+--- a/crates/deps-infer/src/observations.rs
++++ b/crates/deps-infer/src/observations.rs
+@@ -98,6 +98,13 @@ impl ReadView {
+         Ok(self.resolve_path(&absolute, &mut memo, 0)?.path)
+     }
+ 
++    pub fn is_file(&self, path: &Path) -> Result<bool> {
++        let absolute = self.cwd.join(path);
++        let mut memo = self.resolutions.lock().unwrap();
++        let resolved = self.resolve_path(&absolute, &mut memo, 0)?;
++        Ok(resolved.path.is_some() && !resolved.directory)
++    }
++
+     fn resolve_path(
+         &self,
+         path: &Path,
+@@ -301,6 +308,10 @@ impl Recorder {
+         Ok(result)
+     }
+ 
++    pub fn is_file(&self, path: &Path) -> Result<bool> {
++        self.view.is_file(path)
++    }
++
+     pub fn read(&self, path: &Path) -> Result<Arc<Vec<u8>>> {
+         let content = self.view.content(path, true)?;
+         self.trace
+diff --git a/crates/nix-ninja/src/discovery.rs b/crates/nix-ninja/src/discovery.rs
+index 599671b..f3109d0 100644
+--- a/crates/nix-ninja/src/discovery.rs
++++ b/crates/nix-ninja/src/discovery.rs
+@@ -266,11 +266,11 @@ impl Discovery {
+                         return self.fresh(command, seeds);
+                     }
+                 };
+-            trace.resolutions.extend(policy.trace.resolutions);
+             if let Err(reason) = self.policy.lock().unwrap().trace(view, &trace) {
+                 self.bypass(reason);
+                 return Ok(dependencies);
+             }
++            trace.resolutions.extend(policy.trace.resolutions);
+             if let Some(candidate) = candidate {
+                 self.validated.fetch_add(1, Ordering::Relaxed);
+                 if BTreeSet::from_iter(candidate)
+@@ -580,6 +580,34 @@ mod tests {
+         context.finish();
+     }
+ 
++    #[test]
++    fn directory_probe_candidates_bypass_records_and_can_become_files() {
++        let fixture = Fixture::new();
++        let main = fixture.write("main.c", "#if __has_include(\"marker.h\")\n#endif\n");
++        let marker = fixture.cwd().join("marker.h");
++        fs::create_dir(&marker).unwrap();
++        let context = fixture.context(Mode::Record);
++        assert_eq!(fixture.scan(&context), vec![main.clone()]);
++        assert_eq!(context.report().recorded_actions, 0);
++        assert_eq!(context.report().bypasses["nonregular-discovery-input"], 1);
++        context.finish();
++        drop(context);
++        fs::remove_dir(&marker).unwrap();
++        fixture.write("marker.h", "#include COMPUTED\n");
++        let context = fixture.context(Mode::Record);
++        assert_eq!(
++            HashSet::from_iter(fixture.scan(&context)),
++            HashSet::from([main, marker])
++        );
++        assert_eq!(context.report().recorded_actions, 1);
++        context.finish();
++        drop(context);
++        let context = fixture.context(Mode::Record);
++        fixture.scan(&context);
++        assert_eq!(context.report().validated_candidates, 1);
++        assert_eq!(context.report().candidate_mismatches, 0);
++    }
++
+     #[test]
+     fn exhausted_capture_budget_keeps_fresh_results() {
+         let fixture = Fixture::new();
+diff --git a/crates/nix-ninja/src/discovery_bundle.rs b/crates/nix-ninja/src/discovery_bundle.rs
+index 2bf1e78..df8abd7 100644
+--- a/crates/nix-ninja/src/discovery_bundle.rs
++++ b/crates/nix-ninja/src/discovery_bundle.rs
+@@ -156,6 +156,11 @@ impl Bundle {
+                 return Ok(None);
+             }
+         }
++        for id in &record.dependencies {
++            if !view.is_file(self.path(*id)?)? {
++                return Ok(None);
++            }
++        }
+         Ok(Some(
+             record
+                 .dependencies
+@@ -467,6 +472,23 @@ mod tests {
+         assert!(saved.lookup(&key('a'), &fixture.view()).unwrap().is_none());
+     }
+ 
++    #[test]
++    fn a_leaf_replaced_by_a_directory_cannot_validate() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#embed \"marker.bin\"\n");
++        let marker = fixture.write("marker.bin", "data");
++        let saved = Bundle::empty()
++            .updated(
++                &BTreeMap::from([(key('a'), fixture.record(&source))]),
++                &BTreeSet::from([key('a')]),
++            )
++            .unwrap();
++        assert!(saved.lookup(&key('a'), &fixture.view()).unwrap().is_some());
++        fs::remove_file(&marker).unwrap();
++        fs::create_dir(&marker).unwrap();
++        assert!(saved.lookup(&key('a'), &fixture.view()).unwrap().is_none());
++    }
++
+     #[test]
+     fn malformed_indices_keys_and_versions_are_rejected() {
+         let fixture = Fixture::new();
+diff --git a/crates/nix-ninja/src/discovery_policy.rs b/crates/nix-ninja/src/discovery_policy.rs
+index 835121a..899d0f6 100644
+--- a/crates/nix-ninja/src/discovery_policy.rs
++++ b/crates/nix-ninja/src/discovery_policy.rs
+@@ -212,10 +212,14 @@ static DIRECTIVE: LazyLock<Regex> =
+ static LITERAL: LazyLock<Regex> =
+     LazyLock::new(|| Regex::new(r##"^\s*#\s*(include|embed)\s*("[^"\n]+"|<[^>\n]+>)"##).unwrap());
+ static QUERY: LazyLock<Regex> = LazyLock::new(|| {
+-    Regex::new(r##"__has_(include|embed)\s*\(\s*("[^"\n]+"|<[^>\n]+>)\s*\)"##).unwrap()
++    Regex::new(r##"\b__has_(include|embed)\s*\(\s*("[^"\n]+"|<[^>\n]+>)\s*\)"##).unwrap()
+ });
+ static QUERY_START: LazyLock<Regex> =
+-    LazyLock::new(|| Regex::new(r"__has_(include|embed)\s*\(").unwrap());
++    LazyLock::new(|| Regex::new(r"\b__has_(include|embed)\s*\(").unwrap());
++static QUERY_NAME: LazyLock<Regex> =
++    LazyLock::new(|| Regex::new(r"\b__has_(include|embed)\b").unwrap());
++static FEATURE_DIRECTIVE: LazyLock<Regex> =
++    LazyLock::new(|| Regex::new(r"(?m)^\s*#\s*ifn?def\s+__has_(?:include|embed)\b").unwrap());
+ static FEATURE_CHECK: LazyLock<Regex> = LazyLock::new(|| {
+     Regex::new(r"\bdefined\s*(?:\(\s*__has_(?:include|embed)\s*\)|\s+__has_(?:include|embed)\b)")
+         .unwrap()
+@@ -301,11 +305,19 @@ fn source(bytes: &[u8]) -> Check<()> {
+         }
+     }
+     let queries: Vec<_> = QUERY.captures_iter(text).collect();
+-    if queries.len() != QUERY_START.find_iter(text).count() {
++    let expressions = FEATURE_CHECK.replace_all(text, "");
++    let expressions = FEATURE_DIRECTIVE.replace_all(&expressions, "");
++    if queries.len() != QUERY_START.find_iter(text).count()
++        || queries.len() != QUERY_NAME.find_iter(&expressions).count()
++    {
+         return Err("computed-query");
+     }
+     for query in queries {
+-        if !literals.contains(&(query[1].to_owned(), query[2].to_owned())) {
++        let name = &query[2];
++        if name[1..name.len() - 1].contains(['"', '>']) {
++            return Err("unmodeled-header-name");
++        }
++        if &query[1] == "embed" && !literals.contains(&(query[1].to_owned(), query[2].to_owned())) {
+             return Err("unobserved-existence-query");
+         }
+     }
+@@ -332,6 +344,11 @@ pub struct FilePolicy {
+ impl FilePolicy {
+     pub fn trace(&mut self, view: &ReadView, trace: &DiscoveryTrace) -> Check<()> {
+         let mut result = Ok(());
++        for (path, target) in &trace.resolutions {
++            if target.is_some() && !view.is_file(path).unwrap_or(false) {
++                result = Err("nonregular-discovery-input");
++            }
++        }
+         for path in trace.files.keys() {
+             let checked = self.checked.entry(path.clone()).or_insert_with(|| {
+                 let bytes = view.bytes(path).map_err(|_| "unobservable-source")?;
+@@ -480,7 +497,8 @@ mod tests {
+             "#embed RESOURCE\n",
+             "#include /* comment */ \"value.h\"\n",
+             "/* comment */ #include \"value.h\"\n",
+-            "#if __has_include(\"probe.h\")\n#define VALUE 1\n#endif\n",
++            "#define QUERY __has_include\n#if QUERY(\"probe.h\")\n#endif\n",
++            "#if __has_include(\"odd>name.h\")\n#endif\n",
+             "#if __has_include(PICK_HEADER)\n#endif\n",
+             "#inc\\\nlude \"value.h\"\n",
+             "%:include \"value.h\"\n",
+@@ -488,6 +506,7 @@ mod tests {
+             assert!(source(text.as_bytes()).is_err(), "{text}");
+         }
+         assert!(source(b"#if __has_include(\"value.h\")\n#include \"value.h\"\n#endif\n").is_ok());
++        assert!(source(b"#ifdef __has_include\n#if __has_include(\"probe.h\") && __has_include(<other.h>)\n#endif\n#endif\n").is_ok());
+         assert!(source(b"#if __has_embed(\"data.bin\")\n#embed \"data.bin\"\n#endif\n").is_ok());
+         assert!(source(&[0xff, b'\n']).is_err());
+         let fixture = Fixture::new();

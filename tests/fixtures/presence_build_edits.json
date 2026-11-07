@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "name": "literal-presence-inputs",
+  "target": "app",
+  "outputs": [
+    "main.o",
+    "lib.o",
+    "app",
+    "main.o.d",
+    "lib.o.d"
+  ],
+  "directories": [
+    "early",
+    "late"
+  ],
+  "files": {
+    "main.c": "#if __has_include(\"marker.h\")\n#define LOCAL 1\n#else\n#define LOCAL 0\n#endif\n#if __has_include(<ordered.h>)\n#define ORDERED 2\n#else\n#define ORDERED 0\n#endif\n#if __has_include(\"alias.h\")\n#define ALIASED 4\n#else\n#define ALIASED 0\n#endif\n#if __has_include(\"marker.h\") && __has_include(<ordered.h>)\n#define BOTH 8\n#else\n#define BOTH 0\n#endif\nint value(void);\nint main(void) { return value() + LOCAL + ORDERED + ALIASED + BOTH; }\n",
+    "lib.c": "int value(void) { return 3; }\n"
+  },
+  "build_ninja": "rule cc\n  command = cc -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -I../source/early -I../source/late -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nbuild main.o: cc ../source/main.c\nbuild lib.o: cc ../source/lib.c\nbuild app: link main.o lib.o\n",
+  "edits": [
+    {
+      "name": "baseline-absent",
+      "expected_exit": 3
+    },
+    {
+      "name": "angle-query-only-file",
+      "write": {
+        "late/ordered.h": "not a c header\n"
+      },
+      "expected_exit": 5,
+      "stale_probe": true
+    },
+    {
+      "name": "quoted-query-only-file",
+      "write": {
+        "marker.h": "#include \"not-present.h\"\n"
+      },
+      "expected_exit": 14,
+      "stale_probe": true
+    },
+    {
+      "name": "presence-body-with-preserved-mtime",
+      "write": {
+        "marker.h": "changed non-c contents\n"
+      },
+      "preserve_mtime": [
+        "marker.h"
+      ],
+      "expected_exit": 14,
+      "unchanged_artifact": true
+    },
+    {
+      "name": "quoted-query-removal",
+      "remove": [
+        "marker.h"
+      ],
+      "expected_exit": 5,
+      "stale_probe": true
+    },
+    {
+      "name": "directory-is-not-a-header",
+      "directories": [
+        "marker.h"
+      ],
+      "expected_exit": 5,
+      "unchanged_artifact": true
+    },
+    {
+      "name": "directory-becomes-regular-file",
+      "remove": [
+        "marker.h"
+      ],
+      "write": {
+        "marker.h": "marker\n"
+      },
+      "expected_exit": 14,
+      "stale_probe": true
+    },
+    {
+      "name": "positive-angle-file-becomes-directory",
+      "remove": [
+        "late/ordered.h"
+      ],
+      "directories": [
+        "late/ordered.h"
+      ],
+      "expected_exit": 4,
+      "stale_probe": true
+    },
+    {
+      "name": "earlier-angle-query-file",
+      "write": {
+        "early/ordered.h": "earlier marker\n"
+      },
+      "expected_exit": 14,
+      "stale_probe": true
+    },
+    {
+      "name": "earlier-file-becomes-directory",
+      "remove": [
+        "early/ordered.h"
+      ],
+      "directories": [
+        "early/ordered.h"
+      ],
+      "expected_exit": 4,
+      "stale_probe": true
+    },
+    {
+      "name": "query-search-continues-past-directory",
+      "remove": [
+        "late/ordered.h"
+      ],
+      "write": {
+        "late/ordered.h": "later marker\n"
+      },
+      "expected_exit": 14,
+      "stale_probe": true
+    },
+    {
+      "name": "query-file-alias",
+      "remove": [
+        "early/ordered.h"
+      ],
+      "write": {
+        "real/first.h": "non-c marker\n",
+        "real/second.h": "same presence, different bytes\n"
+      },
+      "symlink": {
+        "alias.h": "real/first.h"
+      },
+      "expected_exit": 18,
+      "stale_probe": true
+    },
+    {
+      "name": "query-file-alias-retarget",
+      "remove": [
+        "alias.h"
+      ],
+      "symlink": {
+        "alias.h": "real/second.h"
+      },
+      "expected_exit": 18,
+      "unchanged_artifact": true
+    },
+    {
+      "name": "positive-alias-target-becomes-directory",
+      "remove": [
+        "real/second.h"
+      ],
+      "directories": [
+        "real/second.h"
+      ],
+      "expected_exit": 14,
+      "stale_probe": true
+    },
+    {
+      "name": "alias-target-becomes-file",
+      "remove": [
+        "real/second.h"
+      ],
+      "write": {
+        "real/second.h": "marker again\n"
+      },
+      "expected_exit": 18,
+      "stale_probe": true
+    }
+  ]
+}

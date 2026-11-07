@@ -10,6 +10,7 @@ on:
       - tools/input_view.py
       - tests/fixtures/build_edits.json
       - tests/fixtures/alias_build_edits.json
+      - tests/fixtures/presence_build_edits.json
       - tests/recording_checks.py
       - .github/workflows/recording-state.yml
   pull_request:
@@ -20,6 +21,7 @@ on:
       - tools/input_view.py
       - tests/fixtures/build_edits.json
       - tests/fixtures/alias_build_edits.json
+      - tests/fixtures/presence_build_edits.json
       - tests/recording_checks.py
       - .github/workflows/recording-state.yml
 

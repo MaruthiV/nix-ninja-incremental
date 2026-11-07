@@ -1,10 +1,12 @@
 import copy
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from recording_checks import compare
+from tools.build_oracle import mutate
 
 
 class RecordingOracleTests(unittest.TestCase):
@@ -26,6 +28,19 @@ class RecordingOracleTests(unittest.TestCase):
         changed["steps"][0]["actual_observation"]["sha256"] = "c" * 64
         with self.assertRaisesRegex(RuntimeError, "artifact"):
             compare(disabled, changed)
+
+    def test_fixture_file_kind_changes_preserve_nonempty_directories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary).resolve()
+            mutate(source, {"write": {"probe.h": "data"}})
+            mutate(source, {"remove": ["probe.h"], "directories": ["probe.h"]})
+            self.assertTrue((source / "probe.h").is_dir())
+            mutate(source, {"write": {"probe.h/keep": "keep"}})
+            with self.assertRaises(OSError):
+                mutate(source, {"remove": ["probe.h"]})
+            self.assertEqual((source / "probe.h/keep").read_text(), "keep")
+            mutate(source, {"remove": ["probe.h/keep", "probe.h"], "write": {"probe.h": "new"}})
+            self.assertEqual((source / "probe.h").read_text(), "new")
 
 
 if __name__ == "__main__":

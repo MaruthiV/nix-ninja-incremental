@@ -80,7 +80,13 @@ def mutate(source, edit):
         for name in edit.get("preserve_mtime", [])
     }
     for name in edit.get("remove", []):
-        path_in(source, name).unlink()
+        path = path_in(source, name)
+        if path.is_dir() and not path.is_symlink():
+            path.rmdir()
+        else:
+            path.unlink()
+    for name in edit.get("directories", []):
+        path_in(source, name).mkdir(parents=True)
     for name, data in edit.get("write", {}).items():
         path = path_in(source, name)
         path.parent.mkdir(parents=True, exist_ok=True)
