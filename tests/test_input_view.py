@@ -47,6 +47,34 @@ class InputViewTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "root does not match"):
             InputView(self.view.marker)
 
+    def test_link_chains_cannot_hide_external_mutable_aliases(self):
+        target = self.view.root / "value.h"
+        target.write_text("#define VALUE 1\n")
+        bridge = Path(self.temporary.name) / "bridge.h"
+        bridge.symlink_to(target)
+        (self.view.root / "alias.h").symlink_to(bridge)
+        with self.assertRaisesRegex(ValueError, "escapes stable roots"):
+            self.view.validate_links()
+
+    def test_parent_traversal_cannot_leave_and_reenter_owned_roots(self):
+        target = self.view.root / "value.h"
+        target.write_text("#define VALUE 1\n")
+        bridge = self.view.control / "bridge.h"
+        bridge.symlink_to(target)
+        (self.view.root / "alias.h").symlink_to("../bridge.h")
+        with self.assertRaisesRegex(ValueError, "escapes stable roots"):
+            self.view.validate_links()
+
+    def test_internal_parent_links_preserve_physical_path_semantics(self):
+        (self.view.root / "source" / "child").mkdir(parents=True)
+        target = self.view.root / "source" / "value.h"
+        target.write_text("#define VALUE 1\n")
+        (self.view.root / "directory").symlink_to("source/child")
+        alias = self.view.root / "alias.h"
+        alias.symlink_to("directory/../value.h")
+        self.view.validate_links()
+        self.assertEqual(self.view._resolve_stable(alias), target)
+
 
 if __name__ == "__main__":
     unittest.main()

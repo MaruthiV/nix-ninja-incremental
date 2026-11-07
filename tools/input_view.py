@@ -58,15 +58,49 @@ class InputView:
     def validate_links(self):
         for path in self.root.rglob("*"):
             if path.is_symlink():
-                target = path.resolve()
-                if not target.is_relative_to(self.root):
-                    parts = target.parts
-                    if len(parts) < 4 or parts[:3] != ("/", "nix", "store"):
-                        raise ValueError(f"input-view symlink escapes stable roots: {path}")
-                    if not Path(*parts[:4]).exists():
-                        raise ValueError("input-view symlink targets an absent store root")
+                self._resolve_stable(path)
             elif not path.is_file() and not path.is_dir():
                 raise ValueError(f"unsupported input-view file type: {path}")
+
+    def _stable(self, path):
+        if path.is_relative_to(self.root):
+            return True
+        parts = path.parts
+        return len(parts) >= 4 and parts[:3] == ("/", "nix", "store") and Path(*parts[:4]).exists()
+
+    def _resolve_stable(self, path, depth=0):
+        if depth > 40:
+            raise ValueError("input-view symlink chain exceeds its limit")
+        if path.is_relative_to(self.root):
+            current = self.root
+        elif path.is_relative_to("/nix/store") and self._stable(path):
+            current = Path("/nix/store")
+        else:
+            raise ValueError(f"input-view symlink escapes stable roots: {path}")
+        for part in path.relative_to(current).parts:
+            if current is None or not current.is_dir():
+                return None
+            if part == "..":
+                current = current.parent
+                if not self._stable(current):
+                    raise ValueError("input-view parent lookup escapes stable roots")
+                continue
+            candidate = current / part
+            try:
+                metadata = candidate.lstat()
+            except (FileNotFoundError, NotADirectoryError):
+                if not self._stable(current):
+                    raise ValueError("input-view absence has no stable parent")
+                return None
+            if stat.S_ISLNK(metadata.st_mode):
+                current = self._resolve_stable(current / candidate.readlink(), depth + 1)
+            elif stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode):
+                if not self._stable(candidate):
+                    raise ValueError("input-view lookup escapes stable roots")
+                current = candidate
+            else:
+                raise ValueError(f"unsupported input-view file type: {candidate}")
+        return current
 
 
 if __name__ == "__main__":

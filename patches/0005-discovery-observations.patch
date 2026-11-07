@@ -1,0 +1,1195 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 3469e50..27ea339 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -502,2 +502,5 @@ dependencies = [
+  "regex",
++ "serde",
++ "serde_json",
++ "sha2 0.10.9",
+  "shell-words",
+diff --git a/crates/deps-infer/Cargo.toml b/crates/deps-infer/Cargo.toml
+index 3a00ed5..20a571a 100644
+--- a/crates/deps-infer/Cargo.toml
++++ b/crates/deps-infer/Cargo.toml
+@@ -12,2 +12,5 @@ n2 = { git = "https://github.com/hinshun/n2", branch = "feature/minimal-pub", de
+ regex = "1"
++serde = { version = "1", features = ["derive"] }
++serde_json = "1"
++sha2 = "0.10"
+ shell-words = "1.1.0"
+diff --git a/crates/deps-infer/examples/trace_cost.rs b/crates/deps-infer/examples/trace_cost.rs
+new file mode 100644
+index 0000000..ebf6043
+--- /dev/null
++++ b/crates/deps-infer/examples/trace_cost.rs
+@@ -0,0 +1,472 @@
++use anyhow::{bail, ensure, Result};
++use deps_infer::c_include_parser::{retrieve_c_includes, retrieve_c_includes_observed};
++use deps_infer::observations::{DiscoveryTrace, ReadView};
++use serde::{Deserialize, Serialize};
++use serde_json::json;
++use sha2::{Digest, Sha256};
++use std::collections::{BTreeMap, HashMap};
++use std::fs;
++use std::io::Read;
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++use std::time::Instant;
++
++#[derive(Deserialize)]
++struct Descriptor {
++    schema_version: u32,
++    root: PathBuf,
++}
++
++#[derive(Deserialize)]
++struct CompileCommand {
++    directory: PathBuf,
++    file: PathBuf,
++    command: Option<String>,
++    arguments: Option<Vec<String>>,
++}
++
++#[derive(Deserialize, Serialize)]
++struct Action {
++    file: PathBuf,
++    command: String,
++    seeds: Vec<PathBuf>,
++    expected: Option<Vec<PathBuf>>,
++    trace: Option<DiscoveryTrace>,
++    error: Option<String>,
++}
++
++#[derive(Deserialize, Serialize)]
++struct SharedRecord {
++    dependencies: Vec<usize>,
++    resolutions: Vec<usize>,
++    files: Vec<usize>,
++}
++
++#[derive(Default, Deserialize, Serialize)]
++struct SharedBundle {
++    paths: Vec<PathBuf>,
++    resolutions: Vec<(usize, Option<usize>)>,
++    files: Vec<(usize, String)>,
++    records: BTreeMap<String, SharedRecord>,
++}
++
++fn key(action: &Action) -> Result<String> {
++    Ok(format!(
++        "{:x}",
++        Sha256::digest(serde_json::to_vec(&(&action.command, &action.seeds))?)
++    ))
++}
++
++fn intern(path: &Path, paths: &mut Vec<PathBuf>, ids: &mut HashMap<PathBuf, usize>) -> usize {
++    *ids.entry(path.to_owned()).or_insert_with(|| {
++        paths.push(path.to_owned());
++        paths.len() - 1
++    })
++}
++
++impl SharedBundle {
++    fn pack(actions: &[Action]) -> Result<Self> {
++        let mut bundle = Self::default();
++        let mut paths = HashMap::new();
++        let mut resolutions = HashMap::new();
++        let mut files = HashMap::new();
++        for action in actions {
++            let Some(trace) = &action.trace else {
++                continue;
++            };
++            let mut record = SharedRecord {
++                dependencies: Vec::new(),
++                resolutions: Vec::new(),
++                files: Vec::new(),
++            };
++            for path in action.expected.as_ref().unwrap() {
++                record
++                    .dependencies
++                    .push(intern(path, &mut bundle.paths, &mut paths));
++            }
++            for (path, target) in &trace.resolutions {
++                let path_id = intern(path, &mut bundle.paths, &mut paths);
++                let target_id = target
++                    .as_ref()
++                    .map(|target| intern(target, &mut bundle.paths, &mut paths));
++                let slot = *resolutions.entry(path.clone()).or_insert_with(|| {
++                    bundle.resolutions.push((path_id, target_id));
++                    bundle.resolutions.len() - 1
++                });
++                ensure!(
++                    bundle.resolutions[slot] == (path_id, target_id),
++                    "input changed between observations"
++                );
++                record.resolutions.push(slot);
++            }
++            for (path, digest) in &trace.files {
++                let path_id = intern(path, &mut bundle.paths, &mut paths);
++                let slot = *files.entry(path.clone()).or_insert_with(|| {
++                    bundle.files.push((path_id, digest.clone()));
++                    bundle.files.len() - 1
++                });
++                ensure!(
++                    bundle.files[slot] == (path_id, digest.clone()),
++                    "file changed between observations"
++                );
++                record.files.push(slot);
++            }
++            bundle.records.insert(key(action)?, record);
++        }
++        Ok(bundle)
++    }
++
++    fn validate(&self, action: &Action, view: &ReadView) -> Result<bool> {
++        let Some(record) = self.records.get(&key(action)?) else {
++            return Ok(false);
++        };
++        let paths: Option<Vec<_>> = record
++            .dependencies
++            .iter()
++            .map(|id| self.paths.get(*id).cloned())
++            .collect();
++        if paths != action.expected {
++            return Ok(false);
++        }
++        for slot in &record.resolutions {
++            let (path, target) = self
++                .resolutions
++                .get(*slot)
++                .ok_or_else(|| anyhow::anyhow!("invalid resolution index"))?;
++            let path = self
++                .paths
++                .get(*path)
++                .ok_or_else(|| anyhow::anyhow!("invalid path index"))?;
++            let target = target
++                .map(|id| {
++                    self.paths
++                        .get(id)
++                        .cloned()
++                        .ok_or_else(|| anyhow::anyhow!("invalid target index"))
++                })
++                .transpose()?;
++            if view.resolve(path)? != target {
++                return Ok(false);
++            }
++        }
++        for slot in &record.files {
++            let (path, digest) = self
++                .files
++                .get(*slot)
++                .ok_or_else(|| anyhow::anyhow!("invalid file index"))?;
++            let path = self
++                .paths
++                .get(*path)
++                .ok_or_else(|| anyhow::anyhow!("invalid content path index"))?;
++            if &view.fingerprint(path)? != digest {
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    }
++}
++
++fn build_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
++    for entry in fs::read_dir(root)? {
++        let entry = entry?;
++        if entry.file_name().to_string_lossy().starts_with("meson-") {
++            continue;
++        }
++        if entry.file_type()?.is_dir() {
++            build_files(&entry.path(), files)?;
++        } else if entry.file_type()?.is_file() {
++            files.push(entry.path());
++        }
++    }
++    Ok(())
++}
++
++fn fresh(action: &Action) -> Result<()> {
++    let paths = retrieve_c_includes(&action.command, action.seeds.clone(), None)?;
++    ensure!(
++        Some(paths) == action.expected,
++        "fresh result changed for {}",
++        action.file.display()
++    );
++    Ok(())
++}
++
++fn tree_fingerprint(root: &Path) -> Result<(String, usize, usize)> {
++    fn visit(path: &Path, hash: &mut Sha256, files: &mut usize, bytes: &mut usize) -> Result<()> {
++        let mut entries = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
++        entries.sort_by_key(|entry| entry.file_name());
++        for entry in entries {
++            let name = entry
++                .file_name()
++                .into_string()
++                .map_err(|_| anyhow::anyhow!("non-utf8 tree path"))?;
++            hash.update(name.len().to_le_bytes());
++            hash.update(name.as_bytes());
++            let kind = entry.file_type()?;
++            if kind.is_dir() {
++                hash.update(b"d");
++                visit(&entry.path(), hash, files, bytes)?;
++                hash.update(b"e");
++            } else if kind.is_symlink() {
++                hash.update(b"l");
++                hash.update(serde_json::to_vec(&(
++                    fs::read_link(entry.path())?,
++                    entry.path().canonicalize().ok(),
++                ))?);
++            } else if kind.is_file() {
++                hash.update(b"f");
++                let mut file = fs::File::open(entry.path())?;
++                hash.update(file.metadata()?.len().to_le_bytes());
++                let mut buffer = [0; 65536];
++                loop {
++                    let count = file.read(&mut buffer)?;
++                    if count == 0 {
++                        break;
++                    }
++                    hash.update(&buffer[..count]);
++                    *bytes += count;
++                }
++                *files += 1;
++            } else {
++                bail!("unsupported tree file type");
++            }
++        }
++        Ok(())
++    }
++    let mut hash = Sha256::new();
++    let (mut files, mut bytes) = (0, 0);
++    visit(root, &mut hash, &mut files, &mut bytes)?;
++    Ok((format!("{:x}", hash.finalize()), files, bytes))
++}
++
++fn main() -> Result<()> {
++    let args: Vec<_> = std::env::args_os().skip(1).collect();
++    if !(2..=3).contains(&args.len()) {
++        bail!("usage: trace_cost VIEW.json OUTPUT_DIRECTORY [REPETITIONS]");
++    }
++    let marker = Path::new(&args[0]).canonicalize()?;
++    let control = marker.parent().unwrap();
++    let descriptor: Descriptor = serde_json::from_slice(&fs::read(&marker)?)?;
++    ensure!(
++        descriptor.schema_version == 1,
++        "unsupported input-view version"
++    );
++    let root = descriptor.root.canonicalize()?;
++    ensure!(root == control.join("inputs"), "input-view root mismatch");
++    let lock = fs::File::options()
++        .read(true)
++        .write(true)
++        .open(control.join("view.lock"))?;
++    lock.try_lock()?;
++    let destination = std::env::current_dir()?.join(&args[1]);
++    ensure!(
++        !destination.starts_with(&root),
++        "measurement output is inside input view"
++    );
++    fs::create_dir(&destination)?;
++    let destination = destination.canonicalize()?;
++    ensure!(
++        !destination.starts_with(&root),
++        "measurement output is inside input view"
++    );
++    let repetitions = args
++        .get(2)
++        .map(|value| value.to_str().unwrap().parse())
++        .transpose()?
++        .unwrap_or(3usize);
++    ensure!(repetitions > 0, "repetitions must be positive");
++    let build = root.join("build");
++    std::env::set_current_dir(&build)?;
++    let commands: Vec<CompileCommand> =
++        serde_json::from_slice(&fs::read(build.join("compile_commands.json"))?)?;
++    let mut seeds = Vec::new();
++    build_files(&build, &mut seeds)?;
++    seeds.sort();
++    let observed = Arc::new(ReadView::new(&root, &build)?);
++    let mut actions = Vec::new();
++    for entry in commands {
++        ensure!(
++            entry.directory.canonicalize()? == build,
++            "mixed compilation directories"
++        );
++        let command = match (entry.command, entry.arguments) {
++            (Some(command), _) => command,
++            (None, Some(arguments)) => shell_words::join(arguments),
++            _ => bail!("missing compiler command"),
++        };
++        let mut files = seeds.clone();
++        files.push(entry.file.clone());
++        files.sort();
++        files.dedup();
++        let mut action = Action {
++            file: entry.file,
++            command,
++            seeds: files,
++            expected: None,
++            trace: None,
++            error: None,
++        };
++        match retrieve_c_includes(&action.command, action.seeds.clone(), None) {
++            Ok(expected) => {
++                match retrieve_c_includes_observed(
++                    &action.command,
++                    action.seeds.clone(),
++                    observed.clone(),
++                ) {
++                    Ok((paths, trace)) => {
++                        ensure!(
++                            paths == expected,
++                            "observed discovery differs for {}",
++                            action.file.display()
++                        );
++                        action.trace = Some(trace);
++                    }
++                    Err(error) => action.error = Some(format!("observation fallback: {error:#}")),
++                }
++                action.expected = Some(expected);
++            }
++            Err(error) => action.error = Some(format!("baseline unavailable: {error:#}")),
++        }
++        actions.push(action);
++    }
++    let start = Instant::now();
++    let payload = serde_json::to_vec(&actions)?;
++    let digest = Sha256::digest(&payload);
++    fs::write(destination.join("traces.tmp"), &payload)?;
++    fs::rename(
++        destination.join("traces.tmp"),
++        destination.join("traces.json"),
++    )?;
++    let publication_ns = start.elapsed().as_nanos();
++    let local = control.join(format!("trace-cost-{}", std::process::id()));
++    fs::create_dir(&local)?;
++    fs::write(local.join("plain.json"), &payload)?;
++    let start = Instant::now();
++    let shared = SharedBundle::pack(&actions)?;
++    let packed = serde_json::to_vec(&shared)?;
++    let packed_digest = Sha256::digest(&packed);
++    fs::write(local.join("shared.tmp"), &packed)?;
++    fs::rename(local.join("shared.tmp"), local.join("shared.json"))?;
++    let shared_publication_ns = start.elapsed().as_nanos();
++    let expected_tree = tree_fingerprint(&root)?;
++    let mut report = json!({
++        "schema_version": 1, "mode": "measurement-only; no build reuse",
++        "input_view": serde_json::from_slice::<serde_json::Value>(&fs::read(marker)?)?,
++        "actions": actions.len(), "available": actions.iter().filter(|a| a.expected.is_some()).count(),
++        "observed": actions.iter().filter(|a| a.trace.is_some()).count(),
++        "build_seeds": seeds.len(), "payload_bytes": payload.len(), "publication_ns": publication_ns,
++        "shared_payload_bytes": packed.len(), "shared_publication_ns": shared_publication_ns,
++        "validation_storage": local,
++        "whole_tree": {"sha256": expected_tree.0, "files": expected_tree.1, "bytes": expected_tree.2, "scope": "owned-tree cost only; external-store guards are not measured"},
++        "preparation_stats": observed.stats(), "runs": [],
++    });
++    fs::write(
++        destination.join("result.json"),
++        serde_json::to_vec_pretty(&report)?,
++    )?;
++    for round in 0..repetitions {
++        let mut modes = [
++            "fresh",
++            "observed",
++            "validation-plain",
++            "validation-shared",
++            "whole-tree",
++        ];
++        modes.rotate_left(round % 5);
++        for mode in modes {
++            let view = Arc::new(ReadView::new(&root, &build)?);
++            let start = Instant::now();
++            if mode == "whole-tree" {
++                ensure!(
++                    tree_fingerprint(&root)? == expected_tree,
++                    "owned tree changed"
++                );
++                let elapsed_ns = start.elapsed().as_nanos();
++                report["runs"]
++                    .as_array_mut()
++                    .unwrap()
++                    .push(json!({"round": round, "mode": mode, "elapsed_ns": elapsed_ns}));
++                fs::write(
++                    destination.join("result.json"),
++                    serde_json::to_vec_pretty(&report)?,
++                )?;
++                eprintln!("{round} {mode}: {:.6}s", elapsed_ns as f64 / 1e9);
++                continue;
++            }
++            let decoded;
++            let packed;
++            let current = if mode == "validation-plain" {
++                let bytes = fs::read(local.join("plain.json"))?;
++                ensure!(Sha256::digest(&bytes) == digest, "trace payload changed");
++                decoded = serde_json::from_slice::<Vec<Action>>(&bytes)?;
++                &decoded
++            } else {
++                &actions
++            };
++            let shared = if mode == "validation-shared" {
++                let bytes = fs::read(local.join("shared.json"))?;
++                ensure!(
++                    Sha256::digest(&bytes) == packed_digest,
++                    "shared payload changed"
++                );
++                packed = serde_json::from_slice::<SharedBundle>(&bytes)?;
++                Some(&packed)
++            } else {
++                None
++            };
++            let mut fallbacks = 0;
++            for action in current.iter().filter(|action| action.expected.is_some()) {
++                match mode {
++                    "fresh" => fresh(action)?,
++                    "observed" => match retrieve_c_includes_observed(
++                        &action.command,
++                        action.seeds.clone(),
++                        view.clone(),
++                    ) {
++                        Ok((paths, _)) => {
++                            ensure!(Some(paths) == action.expected, "observed result changed")
++                        }
++                        Err(_) => {
++                            fallbacks += 1;
++                            fresh(action)?;
++                        }
++                    },
++                    "validation-plain" => {
++                        let valid = action
++                            .trace
++                            .as_ref()
++                            .is_some_and(|trace| view.validate(trace).unwrap_or(false));
++                        if !valid {
++                            fallbacks += 1;
++                            fresh(action)?;
++                        }
++                    }
++                    "validation-shared" => {
++                        if !shared.unwrap().validate(action, &view)? {
++                            fallbacks += 1;
++                            fresh(action)?;
++                        }
++                    }
++                    _ => unreachable!(),
++                }
++            }
++            let elapsed_ns = start.elapsed().as_nanos();
++            report["runs"].as_array_mut().unwrap().push(json!({"round": round, "mode": mode, "elapsed_ns": elapsed_ns, "fallbacks": fallbacks, "stats": view.stats()}));
++            fs::write(
++                destination.join("result.json"),
++                serde_json::to_vec_pretty(&report)?,
++            )?;
++            eprintln!(
++                "{round} {mode}: {:.6}s, {fallbacks} fallbacks",
++                elapsed_ns as f64 / 1e9
++            );
++        }
++    }
++    fs::write(destination.join("shared-traces.json"), &packed)?;
++    report["passed"] = json!(true);
++    fs::write(
++        destination.join("result.json"),
++        serde_json::to_vec_pretty(&report)?,
++    )?;
++    Ok(())
++}
+diff --git a/crates/deps-infer/src/c_include_parser.rs b/crates/deps-infer/src/c_include_parser.rs
+index cfe0842..7203b89 100644
+--- a/crates/deps-infer/src/c_include_parser.rs
++++ b/crates/deps-infer/src/c_include_parser.rs
+@@ -1,2 +1,3 @@
+ use crate::gcc_include_parser;
++use crate::observations::{DiscoveryTrace, ReadView, Recorder};
+ use anyhow::{anyhow, Result};
+@@ -10,3 +11,3 @@ use std::fs::File;
+ use std::hash::Hash;
+-use std::io::{BufRead, BufReader};
++use std::io::{BufRead, BufReader, Cursor};
+ use std::path::{Path, PathBuf};
+@@ -20,3 +21,14 @@ pub fn retrieve_c_includes(
+     let includes = gcc_include_parser::parse_include_dirs(cmdline)?;
+-    bfs_parse_includes(files, &includes, virtual_paths)
++    bfs_parse_includes(files, &includes, virtual_paths, None)
++}
++
++pub fn retrieve_c_includes_observed(
++    cmdline: &str,
++    files: Vec<PathBuf>,
++    view: Arc<ReadView>,
++) -> Result<(Vec<PathBuf>, DiscoveryTrace)> {
++    let recorder = Arc::new(Recorder::new(view));
++    let includes = gcc_include_parser::parse_include_dirs(cmdline)?;
++    let result = bfs_parse_includes(files, &includes, None, Some(&recorder))?;
++    Ok((result, recorder.trace()))
+ }
+@@ -28,2 +40,3 @@ fn bfs_parse_includes(
+     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
++    observer: Option<&Arc<Recorder>>,
+ ) -> Result<Vec<PathBuf>> {
+@@ -53,2 +66,3 @@ fn bfs_parse_includes(
+             &path_cache,
++            observer,
+         )?;
+@@ -85,3 +99,3 @@ where
+ {
+-    all_sources_with_cache(paths, includes, virtual_paths, &PathCache::default())
++    all_sources_with_cache(paths, includes, virtual_paths, &PathCache::default(), None)
+ }
+@@ -93,2 +107,3 @@ fn all_sources_with_cache<I, E>(
+     path_cache: &PathCache,
++    observer: Option<&Arc<Recorder>>,
+ ) -> Result<Vec<SourceWithIncludes>>
+@@ -113,2 +128,3 @@ where
+                     path_cache,
++                    observer,
+                 )
+@@ -128,2 +144,3 @@ where
+                 let path_cache = path_cache.clone();
++                let observer = observer.cloned();
+                 std::thread::Builder::new().spawn(move || {
+@@ -134,2 +151,3 @@ where
+                         &path_cache,
++                        observer.as_ref(),
+                     )?;
+@@ -163,3 +181,9 @@ pub fn extract_includes(
+ ) -> Result<Vec<PathBuf>> {
+-    extract_includes_with_cache(path, include_dirs, virtual_paths, &PathCache::default())
++    extract_includes_with_cache(
++        path,
++        include_dirs,
++        virtual_paths,
++        &PathCache::default(),
++        None,
++    )
+ }
+@@ -171,6 +195,36 @@ fn extract_includes_with_cache(
+     path_cache: &PathCache,
++    observer: Option<&Arc<Recorder>>,
++) -> Result<Vec<PathBuf>> {
++    if let Some(observer) = observer {
++        let bytes = observer.read(path)?;
++        extract_from_reader(
++            Cursor::new(bytes.as_slice()),
++            path,
++            include_dirs,
++            virtual_paths,
++            path_cache,
++            Some(observer),
++        )
++    } else {
++        let file = File::open(path)
++            .map_err(|error| anyhow!("Failed to open file {}: {}", path.display(), error))?;
++        extract_from_reader(
++            BufReader::new(file),
++            path,
++            include_dirs,
++            virtual_paths,
++            path_cache,
++            None,
++        )
++    }
++}
++
++fn extract_from_reader<R: BufRead>(
++    reader: R,
++    path: &Path,
++    include_dirs: &[PathBuf],
++    virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
++    path_cache: &PathCache,
++    observer: Option<&Arc<Recorder>>,
+ ) -> Result<Vec<PathBuf>> {
+-    let f =
+-        File::open(path).map_err(|e| anyhow!("Failed to open file {}: {}", path.display(), e))?;
+-    let reader = BufReader::new(f);
+     let mut result = Vec::new();
+@@ -194,4 +248,9 @@ fn extract_includes_with_cache(
+             if inc_type == "\"" {
+-                if let Some(p) = try_resolve(&parent_dir, &relative_path, virtual_paths, path_cache)
+-                {
++                if let Some(p) = try_resolve(
++                    &parent_dir,
++                    &relative_path,
++                    virtual_paths,
++                    path_cache,
++                    observer,
++                )? {
+                     result.push(p);
+@@ -201,7 +260,13 @@ fn extract_includes_with_cache(
+ 
+-            if let Some(p) = include_dirs
+-                .iter()
+-                .find_map(|i| try_resolve(i, &relative_path, virtual_paths, path_cache))
+-            {
+-                result.push(p);
++            for directory in include_dirs {
++                if let Some(path) = try_resolve(
++                    directory,
++                    &relative_path,
++                    virtual_paths,
++                    path_cache,
++                    observer,
++                )? {
++                    result.push(path);
++                    break;
++                }
+             }
+@@ -218,4 +283,9 @@ fn try_resolve(
+     path_cache: &PathCache,
+-) -> Option<PathBuf> {
+-    canonicalize_with_cache(head.join(tail), virtual_paths, path_cache).ok()?
++    observer: Option<&Arc<Recorder>>,
++) -> Result<Option<PathBuf>> {
++    match canonicalize_with_cache(head.join(tail), virtual_paths, path_cache, observer) {
++        Ok(result) => Ok(result),
++        Err(error) if observer.is_some() => Err(error.into()),
++        Err(_) => Ok(None),
++    }
+ }
+@@ -233,3 +303,3 @@ where
+ {
+-    canonicalize_with_cache(path, virtual_paths, &PathCache::default())
++    canonicalize_with_cache(path, virtual_paths, &PathCache::default(), None)
+ }
+@@ -240,2 +310,3 @@ fn canonicalize_with_cache<P>(
+     path_cache: &PathCache,
++    observer: Option<&Arc<Recorder>>,
+ ) -> Result<Option<PathBuf>, std::io::Error>
+@@ -246,2 +317,8 @@ where
+ {
++    if let Some(observer) = observer {
++        return observer
++            .resolve(path.as_ref())
++            .map_err(|error| std::io::Error::other(error.to_string()));
++    }
++
+     // Check virtual paths first if provided
+diff --git a/crates/deps-infer/src/lib.rs b/crates/deps-infer/src/lib.rs
+index 3a8cf1d..8e13d9a 100644
+--- a/crates/deps-infer/src/lib.rs
++++ b/crates/deps-infer/src/lib.rs
+@@ -4 +4,2 @@ mod gcc_depfile_parser;
+ mod gcc_include_parser;
++pub mod observations;
+diff --git a/crates/deps-infer/src/observations.rs b/crates/deps-infer/src/observations.rs
+new file mode 100644
+index 0000000..5481721
+--- /dev/null
++++ b/crates/deps-infer/src/observations.rs
+@@ -0,0 +1,514 @@
++use anyhow::{bail, ensure, Result};
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
++use std::collections::{BTreeMap, HashMap};
++use std::fs;
++use std::io::ErrorKind;
++use std::path::{Component, Path, PathBuf};
++use std::sync::{Arc, Mutex};
++
++const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
++const MAX_RETAINED_BYTES: usize = 128 * 1024 * 1024;
++
++#[derive(Clone, Debug, Default, Deserialize, Serialize)]
++pub struct DiscoveryTrace {
++    pub resolutions: BTreeMap<PathBuf, Option<PathBuf>>,
++    pub files: BTreeMap<PathBuf, String>,
++}
++
++#[derive(Clone)]
++struct Content {
++    digest: String,
++    bytes: Option<Arc<Vec<u8>>>,
++}
++
++#[derive(Default)]
++struct FileMemo {
++    contents: HashMap<PathBuf, Content>,
++    retained_bytes: usize,
++    hashed_bytes: usize,
++}
++
++#[derive(Serialize)]
++pub struct ReadStats {
++    pub files_hashed: usize,
++    pub bytes_hashed: usize,
++    pub resolutions: usize,
++    pub retained_bytes: usize,
++}
++
++#[derive(Clone)]
++struct Resolution {
++    path: Option<PathBuf>,
++    directory: bool,
++}
++
++impl Resolution {
++    fn absent() -> Self {
++        Self {
++            path: None,
++            directory: false,
++        }
++    }
++}
++
++pub struct ReadView {
++    root: PathBuf,
++    cwd: PathBuf,
++    resolutions: Mutex<HashMap<PathBuf, Resolution>>,
++    files: Mutex<FileMemo>,
++}
++
++impl ReadView {
++    pub fn new(root: &Path, cwd: &Path) -> Result<Self> {
++        let root = root.canonicalize()?;
++        let cwd = cwd.canonicalize()?;
++        ensure!(
++            root.is_dir() && cwd.is_dir(),
++            "input roots must be directories"
++        );
++        ensure!(
++            cwd.starts_with(&root),
++            "working directory escapes input view"
++        );
++        Ok(Self {
++            root,
++            cwd,
++            resolutions: Mutex::default(),
++            files: Mutex::default(),
++        })
++    }
++
++    fn stable(&self, path: &Path) -> bool {
++        if path.starts_with(&self.root) {
++            return true;
++        }
++        let Ok(relative) = path.strip_prefix("/nix/store") else {
++            return false;
++        };
++        relative
++            .components()
++            .next()
++            .is_some_and(|name| Path::new("/nix/store").join(name).exists())
++    }
++
++    pub fn resolve(&self, path: &Path) -> Result<Option<PathBuf>> {
++        let absolute = self.cwd.join(path);
++        let mut memo = self.resolutions.lock().unwrap();
++        Ok(self.resolve_path(&absolute, &mut memo, 0)?.path)
++    }
++
++    fn resolve_path(
++        &self,
++        path: &Path,
++        memo: &mut HashMap<PathBuf, Resolution>,
++        depth: usize,
++    ) -> Result<Resolution> {
++        ensure!(depth <= 40, "symlink chain exceeds observation limit");
++        if let Some(result) = memo.get(path) {
++            return Ok(result.clone());
++        }
++        let anchor = if path.starts_with(&self.root) {
++            self.root.clone()
++        } else if let Ok(relative) = path.strip_prefix("/nix/store") {
++            let package = relative
++                .components()
++                .next()
++                .ok_or_else(|| anyhow::anyhow!("store pool is not a stable root"))?;
++            ensure!(
++                Path::new("/nix/store").join(package).exists(),
++                "store package is absent"
++            );
++            PathBuf::from("/nix/store")
++        } else {
++            bail!("lookup escapes stable roots: {}", path.display());
++        };
++        let mut current = Resolution {
++            path: Some(anchor.clone()),
++            directory: true,
++        };
++        for component in path.strip_prefix(&anchor)?.components() {
++            if !current.directory {
++                current = Resolution::absent();
++                break;
++            }
++            let parent = current.path.as_ref().unwrap();
++            let next = match component {
++                Component::CurDir => continue,
++                Component::ParentDir => {
++                    let next = parent
++                        .parent()
++                        .ok_or_else(|| anyhow::anyhow!("lookup escapes filesystem root"))?
++                        .to_owned();
++                    ensure!(self.stable(&next), "parent lookup escapes stable roots");
++                    current = Resolution {
++                        path: Some(next),
++                        directory: true,
++                    };
++                    continue;
++                }
++                Component::Normal(name) => parent.join(name),
++                _ => bail!("unexpected absolute path component"),
++            };
++            current = if let Some(result) = memo.get(&next) {
++                result.clone()
++            } else {
++                let result = match fs::symlink_metadata(&next) {
++                    Ok(metadata) if metadata.is_symlink() => {
++                        let target = parent.join(fs::read_link(&next)?);
++                        self.resolve_path(&target, memo, depth + 1)?
++                    }
++                    Ok(metadata) => {
++                        ensure!(
++                            metadata.is_dir() || metadata.is_file(),
++                            "unsupported lookup file type"
++                        );
++                        ensure!(self.stable(&next), "lookup escapes stable roots");
++                        Resolution {
++                            path: Some(next.clone()),
++                            directory: metadata.is_dir(),
++                        }
++                    }
++                    Err(error)
++                        if matches!(
++                            error.kind(),
++                            ErrorKind::NotFound | ErrorKind::NotADirectory
++                        ) =>
++                    {
++                        ensure!(self.stable(parent), "absence has no stable parent");
++                        Resolution::absent()
++                    }
++                    Err(error) => return Err(error.into()),
++                };
++                memo.insert(next, result.clone());
++                result
++            };
++            if current.path.is_none() {
++                break;
++            }
++        }
++        memo.insert(path.to_owned(), current.clone());
++        Ok(current)
++    }
++
++    fn content(&self, path: &Path, retain: bool) -> Result<Content> {
++        ensure!(
++            self.stable(path),
++            "file escapes stable roots: {}",
++            path.display()
++        );
++        let mut memo = self.files.lock().unwrap();
++        if let Some(content) = memo.contents.get(path) {
++            if !retain || content.bytes.is_some() {
++                return Ok(content.clone());
++            }
++        }
++        let metadata = fs::metadata(path)?;
++        ensure!(metadata.is_file(), "observation requires a regular file");
++        ensure!(
++            metadata.len() <= MAX_FILE_BYTES,
++            "file exceeds observation limit"
++        );
++        if retain {
++            ensure!(
++                memo.retained_bytes + metadata.len() as usize <= MAX_RETAINED_BYTES,
++                "input view exceeds retained-byte limit"
++            );
++        }
++        let bytes = fs::read(path)?;
++        ensure!(
++            bytes.len() as u64 <= MAX_FILE_BYTES,
++            "file exceeds observation limit"
++        );
++        let size = bytes.len();
++        let digest = format!("{:x}", Sha256::digest(&bytes));
++        let content = Content {
++            digest,
++            bytes: retain.then(|| Arc::new(bytes)),
++        };
++        memo.hashed_bytes += size;
++        if retain {
++            memo.retained_bytes += size;
++        }
++        memo.contents.insert(path.to_owned(), content.clone());
++        Ok(content)
++    }
++
++    pub fn validate(&self, trace: &DiscoveryTrace) -> Result<bool> {
++        for (path, expected) in &trace.resolutions {
++            if &self.resolve(path)? != expected {
++                return Ok(false);
++            }
++        }
++        for (path, expected) in &trace.files {
++            if &self.content(path, false)?.digest != expected {
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    }
++
++    pub fn fingerprint(&self, path: &Path) -> Result<String> {
++        Ok(self.content(path, false)?.digest)
++    }
++
++    pub fn stats(&self) -> ReadStats {
++        let files = self.files.lock().unwrap();
++        ReadStats {
++            files_hashed: files.contents.len(),
++            bytes_hashed: files.hashed_bytes,
++            resolutions: self.resolutions.lock().unwrap().len(),
++            retained_bytes: files.retained_bytes,
++        }
++    }
++}
++
++pub(crate) struct Recorder {
++    view: Arc<ReadView>,
++    trace: Mutex<DiscoveryTrace>,
++}
++
++impl Recorder {
++    pub fn new(view: Arc<ReadView>) -> Self {
++        Self {
++            view,
++            trace: Mutex::default(),
++        }
++    }
++
++    pub fn resolve(&self, path: &Path) -> Result<Option<PathBuf>> {
++        let result = self.view.resolve(path)?;
++        self.trace
++            .lock()
++            .unwrap()
++            .resolutions
++            .insert(self.view.cwd.join(path), result.clone());
++        Ok(result)
++    }
++
++    pub fn read(&self, path: &Path) -> Result<Arc<Vec<u8>>> {
++        let content = self.view.content(path, true)?;
++        self.trace
++            .lock()
++            .unwrap()
++            .files
++            .insert(path.to_owned(), content.digest);
++        Ok(content.bytes.unwrap())
++    }
++
++    pub fn trace(&self) -> DiscoveryTrace {
++        self.trace.lock().unwrap().clone()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::c_include_parser::{retrieve_c_includes, retrieve_c_includes_observed};
++    use std::sync::atomic::{AtomicU64, Ordering};
++
++    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
++
++    struct Fixture(PathBuf);
++
++    impl Fixture {
++        fn new() -> Self {
++            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
++            let path =
++                std::env::temp_dir().join(format!("nni-observations-{}-{id}", std::process::id()));
++            fs::create_dir(&path).unwrap();
++            Self(path.canonicalize().unwrap())
++        }
++
++        fn write(&self, name: &str, bytes: impl AsRef<[u8]>) -> PathBuf {
++            let path = self.0.join(name);
++            fs::create_dir_all(path.parent().unwrap()).unwrap();
++            fs::write(&path, bytes).unwrap();
++            path
++        }
++
++        fn view(&self) -> Arc<ReadView> {
++            Arc::new(ReadView::new(&self.0, &self.0).unwrap())
++        }
++
++        fn trace(&self, command: &str, source: &Path) -> DiscoveryTrace {
++            let seeds = vec![source.to_owned()];
++            let (observed, trace) =
++                retrieve_c_includes_observed(command, seeds.clone(), self.view()).unwrap();
++            assert_eq!(observed, retrieve_c_includes(command, seeds, None).unwrap());
++            trace
++        }
++    }
++
++    impl Drop for Fixture {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.0);
++        }
++    }
++
++    #[test]
++    fn newly_shadowing_header_invalidates_negative_observation() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#include <value.h>\n");
++        fs::create_dir(fixture.0.join("early")).unwrap();
++        fixture.write("late/value.h", "#define VALUE 1\n");
++        let command = shell_words::join([
++            "cc".to_owned(),
++            format!("-I{}", fixture.0.join("early").display()),
++            format!("-I{}", fixture.0.join("late").display()),
++        ]);
++        let trace = fixture.trace(&command, &source);
++        assert!(fixture.view().validate(&trace).unwrap());
++        fixture.write("early/value.h", "#define VALUE 2\n");
++        assert!(!fixture.view().validate(&trace).unwrap());
++    }
++
++    #[test]
++    fn content_change_with_preserved_mtime_invalidates() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#include \"value.h\"\n");
++        let header = fixture.write("value.h", "#define VALUE 1\n");
++        let trace = fixture.trace("cc -c main.c", &source);
++        let modified = fs::metadata(&header).unwrap().modified().unwrap();
++        fixture.write("value.h", "#define VALUE 2\n");
++        fs::File::open(&header)
++            .unwrap()
++            .set_times(fs::FileTimes::new().set_modified(modified))
++            .unwrap();
++        assert_eq!(fs::metadata(header).unwrap().modified().unwrap(), modified);
++        assert!(!fixture.view().validate(&trace).unwrap());
++    }
++
++    #[test]
++    fn irrelevant_changes_preserve_the_trace() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "int main(void) { return 0; }\n");
++        let trace = fixture.trace("cc -c main.c", &source);
++        fixture.write("unrelated/other.h", "#define OTHER 9\n");
++        assert!(fixture.view().validate(&trace).unwrap());
++    }
++
++    #[test]
++    fn absent_parent_appearance_invalidates() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#include \"optional/value.h\"\n");
++        let trace = fixture.trace("cc -c main.c", &source);
++        fixture.write("optional/value.h", "#define VALUE 1\n");
++        assert!(!fixture.view().validate(&trace).unwrap());
++    }
++
++    #[test]
++    fn raw_fingerprints_preserve_invalid_utf8_parser_behavior() {
++        let fixture = Fixture::new();
++        let source = fixture.write(
++            "main.c",
++            b"#include \"first.h\"\n\xff\n#include \"second.h\"\n",
++        );
++        let first = fixture.write("first.h", "#define FIRST 1\n");
++        let second = fixture.write("second.h", "#define SECOND 2\n");
++        let trace = fixture.trace("cc -c main.c", &source);
++        assert!(trace.files.contains_key(&first));
++        assert!(!trace.files.contains_key(&second));
++        fixture.write(
++            "main.c",
++            b"#include \"first.h\"\n\xfe\n#include \"second.h\"\n",
++        );
++        assert!(!fixture.view().validate(&trace).unwrap());
++    }
++
++    #[test]
++    fn shared_memo_keeps_complete_per_action_traces() {
++        let fixture = Fixture::new();
++        let first = fixture.write("first.c", "#include \"shared.h\"\n");
++        let second = fixture.write("second.c", "#include \"shared.h\"\n");
++        let header = fixture.write("shared.h", "#define VALUE 1\n");
++        let view = fixture.view();
++        let (_, a) = retrieve_c_includes_observed("cc", vec![first], view.clone()).unwrap();
++        let (_, b) = retrieve_c_includes_observed("cc", vec![second], view.clone()).unwrap();
++        assert!(a.files.contains_key(&header));
++        assert!(b.files.contains_key(&header));
++        assert_eq!(view.stats().files_hashed, 3);
++        assert_eq!(a.files[&header], b.files[&header]);
++        let validation = fixture.view();
++        assert!(validation.validate(&a).unwrap());
++        assert!(validation.validate(&b).unwrap());
++        assert_eq!(validation.stats().files_hashed, 3);
++        assert_eq!(validation.stats().retained_bytes, 0);
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn symlink_retarget_invalidates_even_with_equal_file_bytes() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#include \"alias.h\"\n");
++        let first = fixture.write("first.h", "#define VALUE 1\n");
++        let second = fixture.write("second.h", "#define VALUE 1\n");
++        let alias = fixture.0.join("alias.h");
++        std::os::unix::fs::symlink(first, &alias).unwrap();
++        let trace = fixture.trace("cc", &source);
++        fs::remove_file(&alias).unwrap();
++        std::os::unix::fs::symlink(second, alias).unwrap();
++        assert!(!fixture.view().validate(&trace).unwrap());
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn dangling_external_symlinks_cannot_certify_absence() {
++        let fixture = Fixture::new();
++        let external = Fixture::new();
++        let alias = fixture.0.join("alias");
++        std::os::unix::fs::symlink(external.0.join("missing"), &alias).unwrap();
++        assert!(fixture.view().resolve(&alias.join("header.h")).is_err());
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn external_aliases_are_rejected_even_when_the_target_is_owned() {
++        let fixture = Fixture::new();
++        let external = Fixture::new();
++        let header = fixture.write("value.h", "#define VALUE 1\n");
++        let alias = external.0.join("alias.h");
++        std::os::unix::fs::symlink(header, &alias).unwrap();
++        assert!(fixture.view().resolve(&alias).is_err());
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn owned_links_cannot_hide_an_external_alias_in_the_chain() {
++        let fixture = Fixture::new();
++        let external = Fixture::new();
++        let header = fixture.write("value.h", "#define VALUE 1\n");
++        let bridge = external.0.join("bridge.h");
++        let alias = fixture.0.join("alias.h");
++        std::os::unix::fs::symlink(header, &bridge).unwrap();
++        std::os::unix::fs::symlink(bridge, &alias).unwrap();
++        assert!(fixture.view().resolve(&alias).is_err());
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn parent_components_follow_the_physical_symlink_target() {
++        let fixture = Fixture::new();
++        fs::create_dir_all(fixture.0.join("actual/child")).unwrap();
++        let header = fixture.write("actual/value.h", "#define VALUE 1\n");
++        std::os::unix::fs::symlink("actual/child", fixture.0.join("alias")).unwrap();
++        let query = fixture.0.join("alias/../value.h");
++        assert_eq!(query.canonicalize().unwrap(), header);
++        assert_eq!(fixture.view().resolve(&query).unwrap(), Some(header));
++    }
++
++    #[test]
++    fn missing_or_regular_file_parents_do_not_collapse_lexically() {
++        let fixture = Fixture::new();
++        fixture.write("value.h", "#define VALUE 1\n");
++        fixture.write("regular", "not a directory\n");
++        for parent in ["missing", "regular"] {
++            let query = fixture.0.join(parent).join("../value.h");
++            assert_eq!(
++                crate::c_include_parser::canonicalize_cached(query.clone(), None).unwrap(),
++                None
++            );
++            assert_eq!(fixture.view().resolve(&query).unwrap(), None);
++        }
++    }
++}
