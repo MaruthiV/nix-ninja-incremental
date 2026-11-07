@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "name": "literal-c-build-edits",
+  "target": "app",
+  "outputs": [
+    "main.o",
+    "lib.o",
+    "app",
+    "main.o.d",
+    "lib.o.d",
+    "generated.h"
+  ],
+  "directories": [
+    "early"
+  ],
+  "files": {
+    "main.c": "#include \"outer.h\"\nint main(void) { return value(); }\n",
+    "lib.c": "#include \"outer.h\"\n#if __has_include(\"bonus.h\")\n#include \"bonus.h\"\n#else\n#define BONUS 0\n#endif\nint value(void) { return VALUE + 0 + BONUS; }\n",
+    "outer.h": "#include <value.h>\nint value(void);\n",
+    "late/value.h": "#define VALUE 3\n"
+  },
+  "build_ninja": "rule cc\n  command = cc -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -I../source/early -I../source/late -I../source -I. -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nbuild main.o: cc ../source/main.c\nbuild lib.o: cc ../source/lib.c\nbuild app: link main.o lib.o\n",
+  "edits": [
+    {
+      "name": "baseline",
+      "expected_exit": 3
+    },
+    {
+      "name": "artifact-only-edit",
+      "write": {
+        "lib.c": "#include \"outer.h\"\n#if __has_include(\"bonus.h\")\n#include \"bonus.h\"\n#else\n#define BONUS 0\n#endif\nint value(void) { return VALUE + 0 + BONUS; }\nint unused(void) { return 17; }\n"
+      },
+      "expected_exit": 3,
+      "stale_probe": true
+    },
+    {
+      "name": "irrelevant-edit",
+      "write": {
+        "unused.txt": "not a build input\n"
+      },
+      "expected_exit": 3,
+      "unchanged_artifact": true
+    },
+    {
+      "name": "implementation-edit",
+      "write": {
+        "lib.c": "#include \"outer.h\"\n#if __has_include(\"bonus.h\")\n#include \"bonus.h\"\n#else\n#define BONUS 0\n#endif\nint value(void) { return VALUE + 1 + BONUS; }\n"
+      },
+      "expected_exit": 4,
+      "stale_probe": true
+    },
+    {
+      "name": "transitive-header-edit",
+      "write": {
+        "late/value.h": "#define VALUE 7\n"
+      },
+      "expected_exit": 8
+    },
+    {
+      "name": "preserved-mtime-edit",
+      "write": {
+        "late/value.h": "#define VALUE 9\n"
+      },
+      "preserve_mtime": [
+        "late/value.h"
+      ],
+      "expected_exit": 10
+    },
+    {
+      "name": "invalid-source",
+      "write": {
+        "lib.c": "#include \"outer.h\"\nint value(void) { return VALUE + ; }\n"
+      },
+      "expected_exit": null,
+      "diagnostic_file": "lib.c",
+      "stale_probe": true
+    },
+    {
+      "name": "source-recovery",
+      "write": {
+        "lib.c": "#include \"outer.h\"\n#if __has_include(\"bonus.h\")\n#include \"bonus.h\"\n#else\n#define BONUS 0\n#endif\nint value(void) { return VALUE + 2 + BONUS; }\n"
+      },
+      "expected_exit": 11
+    },
+    {
+      "name": "optional-header-appears",
+      "write": {
+        "bonus.h": "#define BONUS 5\n"
+      },
+      "expected_exit": 16
+    },
+    {
+      "name": "earlier-header-appears",
+      "write": {
+        "early/value.h": "#define VALUE 20\n"
+      },
+      "expected_exit": 27
+    },
+    {
+      "name": "include-order-change",
+      "build_ninja": "rule cc\n  command = cc -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -I../source/late -I../source/early -I../source -I. -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nbuild main.o: cc ../source/main.c\nbuild lib.o: cc ../source/lib.c\nbuild app: link main.o lib.o\n",
+      "expected_exit": 16
+    },
+    {
+      "name": "source-symlink",
+      "write": {
+        "impl-one.c": "#include \"outer.h\"\n#if __has_include(\"bonus.h\")\n#include \"bonus.h\"\n#else\n#define BONUS 0\n#endif\nint value(void) { return VALUE + 2 + BONUS; }\n",
+        "impl-two.c": "#include \"alias-value.h\"\n#include \"outer.h\"\n#if __has_include(\"bonus.h\")\n#include \"bonus.h\"\n#else\n#define BONUS 0\n#endif\nint value(void) { return VALUE + 3 + BONUS + ALIAS; }\n",
+        "alias-value.h": "#define ALIAS 4\n"
+      },
+      "remove": [
+        "lib.c"
+      ],
+      "symlink": {
+        "lib.c": "impl-one.c"
+      },
+      "expected_exit": 16
+    },
+    {
+      "name": "symlink-retarget",
+      "remove": [
+        "lib.c"
+      ],
+      "symlink": {
+        "lib.c": "impl-two.c"
+      },
+      "expected_exit": 21,
+      "stale_probe": true
+    },
+    {
+      "name": "generated-header",
+      "write": {
+        "lib.c": "#include \"outer.h\"\n#if __has_include(\"bonus.h\")\n#include \"bonus.h\"\n#else\n#define BONUS 0\n#endif\n#include \"generated.h\"\nint value(void) { return VALUE + 3 + BONUS + GENERATED; }\n"
+      },
+      "build_ninja": "rule cc\n  command = cc -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -I../source/late -I../source/early -I../source -I. -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nrule generate\n  command = printf '#define GENERATED 4\\n' > $out\nbuild generated.h: generate\nbuild main.o: cc ../source/main.c\nbuild lib.o: cc ../source/lib.c || generated.h\nbuild app: link main.o lib.o\n",
+      "expected_exit": 21
+    },
+    {
+      "name": "generator-change",
+      "build_ninja": "rule cc\n  command = cc -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -I../source/late -I../source/early -I../source -I. -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nrule generate\n  command = printf '#define GENERATED 5\\n' > $out\nbuild generated.h: generate\nbuild main.o: cc ../source/main.c\nbuild lib.o: cc ../source/lib.c || generated.h\nbuild app: link main.o lib.o\n",
+      "expected_exit": 22
+    },
+    {
+      "name": "header-deletion-fallback",
+      "remove": [
+        "late/value.h"
+      ],
+      "expected_exit": 33
+    },
+    {
+      "name": "missing-required-header",
+      "remove": [
+        "early/value.h"
+      ],
+      "expected_exit": null,
+      "diagnostic_file": "outer.h"
+    },
+    {
+      "name": "header-recovery",
+      "write": {
+        "late/value.h": "#define VALUE 12\n"
+      },
+      "expected_exit": 25
+    }
+  ]
+}

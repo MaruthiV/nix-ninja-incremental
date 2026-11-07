@@ -1,12 +1,16 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import sys
+import tarfile
 import time
 
+from input_view import InputView
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKLOADS = json.loads((ROOT / "benchmarks/workloads.json").read_text())["workloads"]
@@ -37,7 +41,7 @@ def prepare(workload):
 
 def configure(workload, build_dir):
     if workload["name"] != "zstd":
-        raise ValueError("Nix configuration uses the upstream example environment; not automated here yet")
+        raise ValueError("use capture nix inside the pinned nixWorkload.shell")
     source = prepare(workload)
     arguments = ["meson", "setup", str(build_dir), str(source / workload["meson_source"])]
     if (build_dir / "meson-private/coredata.dat").exists():
@@ -64,6 +68,76 @@ def configure(workload, build_dir):
     with path.open("x") as record:
         record.write(json.dumps(manifest, indent=2) + "\n")
     print(database)
+
+
+def capture(workload):
+    view = InputView.create(provenance={"workload": workload})
+    record = {"schema_version": 1, "input_view": view.data, "passed": False}
+    try:
+        with view.lease() as owned:
+            source, build = owned / "source", owned / "build"
+            start = time.monotonic_ns()
+            if workload["name"] == "nix":
+                file = json.dumps(str(ROOT / "environment/baseline.nix")).replace("${", "\\${")
+                expression = f'(import (builtins.toPath {file}) {{ cliRuntime = true; }}).nixWorkload'
+                configuration = json.loads(output([
+                    "nix", "eval", "--impure", "--json", "--expr",
+                    f"let w = {expression}; in {{ inherit (w) source revision mesonFlags environment; }}",
+                ]))
+                if configuration["revision"] != workload["source"]["revision"]:
+                    raise ValueError("Nix workload environment and manifest pins disagree")
+                shutil.copytree(configuration["source"], source, symlinks=True)
+                for name, _, files in os.walk(source):
+                    directory = Path(name)
+                    directory.chmod(directory.stat().st_mode | 0o200)
+                    for name in files:
+                        path = directory / name
+                        if not path.is_symlink():
+                            path.chmod(path.stat().st_mode | 0o200)
+                arguments = ["meson", "setup", str(build), str(source), *configuration["mesonFlags"]]
+                record["configuration"] = configuration
+            else:
+                original = prepare(workload)
+                archive = view.control / "source.tar"
+                with archive.open("xb") as stream:
+                    run(["git", "-C", str(original), "archive", "--format=tar", workload["source"]["revision"]], stdout=stream)
+                record["archive_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+                source.mkdir()
+                with tarfile.open(archive) as stream:
+                    stream.extractall(source, filter="data")
+                arguments = ["meson", "setup", str(build), str(source / workload["meson_source"])]
+                for name, value in workload["meson_options"].items():
+                    value = str(value).lower() if isinstance(value, bool) else str(value)
+                    arguments.append(f"-D{name}={value}")
+            record["snapshot_ns"] = time.monotonic_ns() - start
+            record["configure_argv"] = arguments
+            start = time.monotonic_ns()
+            with (view.control / "configure.log").open("x") as log:
+                result = subprocess.run(arguments, text=True, stdout=log, stderr=subprocess.STDOUT)
+            record.update(configure_ns=time.monotonic_ns() - start, returncode=result.returncode)
+            if result.returncode:
+                raise RuntimeError(f"workload configuration failed; see {view.control / 'configure.log'}")
+            view.validate_links()
+            database = build / "compile_commands.json"
+            record.update(
+                source=str(source), build=str(build),
+                actions=len(json.loads(database.read_text())),
+                commands_sha256=hashlib.sha256(database.read_bytes()).hexdigest(),
+                passed=True,
+            )
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        record["error"] = str(error)
+        raise
+    finally:
+        contents = json.dumps(record, indent=2) + "\n"
+        (view.control / "capture.json").write_text(contents)
+        destination = ROOT / "results/workloads" / workload["name"]
+        destination.mkdir(parents=True, exist_ok=True)
+        stem = "captured-" + view.data["id"]
+        (destination / f"{stem}.json").write_text(contents)
+        if (view.control / "configure.log").exists():
+            shutil.copyfile(view.control / "configure.log", destination / f"{stem}.log")
+        print(view.marker, flush=True)
 
 
 def check(workload, build_dir):
@@ -111,7 +185,7 @@ def check(workload, build_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Pinned real workloads for nix-ninja measurements")
-    parser.add_argument("action", choices=["prepare", "configure", "ninja", "check"])
+    parser.add_argument("action", choices=["prepare", "capture", "configure", "ninja", "check"])
     parser.add_argument("workload", choices=[workload["name"] for workload in WORKLOADS])
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--jobs", type=int, default=2)
@@ -122,6 +196,8 @@ def main():
     build_dir = (args.build_dir or ROOT / ".work/build" / args.workload).resolve()
     if args.action == "prepare":
         print(prepare(workload))
+    elif args.action == "capture":
+        capture(workload)
     elif args.action == "configure":
         configure(workload, build_dir)
     elif args.action == "check":

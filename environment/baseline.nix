@@ -24,4 +24,17 @@ in {
   shell = pkgs.mkShell {
     packages = with pkgs; [ nix-ninja nix-ninja-task runtime gcc coreutils patchelf meson ninja python3 ];
   };
+  nixWorkload = {
+    source = upstream.inputs.nix.outPath;
+    revision = upstream.inputs.nix.rev;
+    mesonFlags = pkgs.example-nix.mesonFlags;
+    environment = {
+      inherit (pkgs.example-nix) BOOST_INCLUDEDIR BOOST_LIBRARYDIR;
+    };
+    shell = pkgs.mkShell {
+      inputsFrom = [ pkgs.example-nix ];
+      packages = with pkgs; [ ninja python3 git ];
+      inherit (pkgs.example-nix) BOOST_INCLUDEDIR BOOST_LIBRARYDIR;
+    };
+  };
 }
