@@ -1,0 +1,146 @@
+diff --git a/crates/nix-ninja/src/discovery.rs b/crates/nix-ninja/src/discovery.rs
+index 4161c4d..599671b 100644
+--- a/crates/nix-ninja/src/discovery.rs
++++ b/crates/nix-ninja/src/discovery.rs
+@@ -57,6 +57,7 @@ pub struct Report {
+     validation_errors: u64,
+     scans: u64,
+     bypasses: BTreeMap<&'static str, u64>,
++    unsupported_files: BTreeMap<String, &'static str>,
+     loaded_records: usize,
+     recorded_actions: usize,
+     estimated_record_bytes: usize,
+@@ -346,6 +347,7 @@ impl Discovery {
+     }
+ 
+     pub fn report(&self) -> Report {
++        let unsupported_files = self.policy.lock().unwrap().failures();
+         let state = self.state.lock().unwrap();
+         Report {
+             schema_version: 1,
+@@ -365,6 +367,7 @@ impl Discovery {
+             validation_errors: self.validation_errors.load(Ordering::Relaxed),
+             scans: self.scans.load(Ordering::Relaxed),
+             bypasses: state.bypasses.clone(),
++            unsupported_files,
+             loaded_records: self.previous.counts().records,
+             recorded_actions: state.used.len(),
+             estimated_record_bytes: state.captured_bytes,
+diff --git a/crates/nix-ninja/src/discovery_policy.rs b/crates/nix-ninja/src/discovery_policy.rs
+index 58fad18..1ef7d37 100644
+--- a/crates/nix-ninja/src/discovery_policy.rs
++++ b/crates/nix-ninja/src/discovery_policy.rs
+@@ -228,11 +228,15 @@ fn continued_dependency(text: &str) -> bool {
+         }
+         if active {
+             joined.push_str(line);
+-            let dependency = DIRECTIVE.captures(&joined).is_some_and(|directive| {
+-                matches!(
+-                    &directive[1],
+-                    "include" | "embed" | "include_next" | "import"
+-                )
++            let dependency = joined.match_indices('#').any(|(index, _)| {
++                DIRECTIVE
++                    .captures(&joined[index..])
++                    .is_some_and(|directive| {
++                        matches!(
++                            &directive[1],
++                            "include" | "embed" | "include_next" | "import"
++                        )
++                    })
+             });
+             if dependency || joined.contains("__has_include") || joined.contains("__has_embed") {
+                 return true;
+@@ -279,11 +283,7 @@ fn source(bytes: &[u8]) -> Check<()> {
+                 "pragma" if line.contains("pch") => return Err("unsupported-preprocessor-mode"),
+                 _ => {}
+             }
+-        } else if line.contains('#')
+-            && ["include", "embed", "import"]
+-                .iter()
+-                .any(|word| line.contains(word))
+-        {
++        } else if unmodeled_directive(line) {
+             return Err("unmodeled-directive-spelling");
+         }
+     }
+@@ -299,6 +299,18 @@ fn source(bytes: &[u8]) -> Check<()> {
+     Ok(())
+ }
+ 
++fn unmodeled_directive(line: &str) -> bool {
++    let Some((prefix, _)) = line.split_once('#') else {
++        return false;
++    };
++    if prefix.trim_start().starts_with('*') && !line.contains("*/") {
++        return false;
++    }
++    ["include", "embed", "import"]
++        .iter()
++        .any(|word| line.contains(word))
++}
++
+ #[derive(Default)]
+ pub struct FilePolicy {
+     checked: HashMap<PathBuf, Check<()>>,
+@@ -315,6 +327,19 @@ impl FilePolicy {
+         }
+         Ok(())
+     }
++
++    pub fn failures(&self) -> BTreeMap<String, &'static str> {
++        let mut failures = BTreeMap::new();
++        for (path, status) in &self.checked {
++            if let Err(reason) = status {
++                failures.insert(path.to_string_lossy().into_owned(), *reason);
++                if failures.len() > 32 {
++                    failures.pop_last();
++                }
++            }
++        }
++        failures
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -504,6 +529,40 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn starred_examples_are_text_but_comment_closures_still_bypass() {
++        assert!(source(b"/*\n *   #include \"xxhash.h\"\n */\nint value;\n").is_ok());
++        for text in [
++            "/*\n * text */ #include \"value.h\"\n",
++            "/*\n * # example */ #include \"value.h\"\n",
++            "/*\n * text *\\\n/ #i\\\nnclude \"value.h\"\n",
++        ] {
++            assert!(source(text.as_bytes()).is_err(), "{text}");
++        }
++    }
++
++    #[test]
++    fn failure_examples_are_bounded_and_sorted() {
++        let fixture = Fixture::new();
++        let files = (0..64)
++            .map(|index| fixture.write(&format!("header-{index:02}.h"), "#include COMPUTED\n"))
++            .collect::<Vec<_>>();
++        let view = Arc::new(ReadView::new(&fixture.0, &fixture.0).unwrap());
++        let mut policy = FilePolicy::default();
++        for path in files {
++            let (_, trace) =
++                retrieve_c_dependency_paths_observed("cc", vec![path], view.clone()).unwrap();
++            assert!(policy.trace(&view, &trace).is_err());
++        }
++        let examples = policy.failures();
++        assert_eq!(examples.len(), 32);
++        assert!(examples.keys().next().unwrap().ends_with("header-00.h"));
++        assert!(examples.keys().last().unwrap().ends_with("header-31.h"));
++        assert!(examples
++            .values()
++            .all(|reason| *reason == "computed-dependency"));
++    }
++
+     #[test]
+     fn mutable_system_paths_and_ambient_search_are_rejected() {
+         let fixture = Fixture::new();

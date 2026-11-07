@@ -15,6 +15,36 @@ import workloads
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def snapshot_unsupported(view, coverage, destination):
+    files = {}
+    for run in coverage:
+        files.update(run.get("unsupported_files", {}))
+    samples = destination / "unsupported"
+    samples.mkdir()
+    records = []
+    retained = 0
+    for index, (name, reason) in enumerate(sorted(files.items())):
+        record = {"path": name, "reason": reason}
+        records.append(record)
+        path = Path(name)
+        try:
+            if view._resolve_stable(path) != path or not path.is_file():
+                raise ValueError("diagnostic source is not a canonical stable file")
+            size = path.stat().st_size
+            record["bytes"] = size
+            if size > 1024 * 1024 or retained + size > 4 * 1024 * 1024:
+                record["omitted"] = "source snapshot budget"
+                continue
+            target = samples / f"source-{index}"
+            shutil.copyfile(path, target)
+            target.chmod(0o644)
+            record.update(snapshot=str(target.relative_to(destination)), sha256=realize.digest(target))
+            retained += size
+        except (OSError, ValueError) as error:
+            record["diagnostic_error"] = str(error)
+    return records
+
+
 def audit(workload, destination):
     record = {"schema_version": 1, "passed": False, "workload": workload,
               "stage": "record-only eligibility and derivation audit; no reuse or speedup"}
@@ -43,6 +73,7 @@ def audit(workload, destination):
             record["coverage"] = [{"warmup": run["warmup"], **run["discovery"]}
                                   for run in report["runs"] if run["mode"] == "record"]
             with view.lease():
+                record["unsupported_samples"] = snapshot_unsupported(view, record["coverage"], destination)
                 state = Path(report["cache_root"]) / "record/state.json"
                 snapshot = destination / "recorded-state.json"
                 shutil.copyfile(state, snapshot)
