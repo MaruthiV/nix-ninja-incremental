@@ -21,10 +21,12 @@ jobs:
       - name: Formatting
         run: cargo +1.95.0 fmt --manifest-path benchmarks/scanner/Cargo.toml --check
       - name: Compiler checks
-        run: cargo +1.95.0 clippy --locked --release --manifest-path benchmarks/scanner/Cargo.toml -- -D warnings
+        run: cargo +1.95.0 clippy --locked --release --all-targets --manifest-path benchmarks/scanner/Cargo.toml -- -D warnings
       - name: Scanner binary
         run: cargo +1.95.0 build --locked --release --manifest-path benchmarks/scanner/Cargo.toml
       - name: Oracle sensitivity
         run: python3 -m unittest discover -s tests -v
       - name: Compiler versus scanner
         run: python3 tools/oracle.py --scanner .work/target/release/nni-scanner-bench --output results/ci/scanner.json
+      - name: Path observation diagnostics
+        run: cargo +1.95.0 run --locked --release --manifest-path benchmarks/scanner/Cargo.toml --example path_cache
