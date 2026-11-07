@@ -132,7 +132,7 @@ def probe():
 
 def baseline():
     prepare()
-    destination = ROOT / "results/setup" / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    destination = ROOT / "results/setup" / f"baseline-{time.time_ns()}"
     destination.mkdir(parents=True)
     for attempt in range(2):
         args = exec_args([
@@ -149,10 +149,18 @@ def baseline():
             "store_state": "initially uncontrolled" if attempt == 0 else "warmed by first attempt",
         }
         if result.returncode == 0:
-            path = result.stdout.strip().splitlines()[-1]
-            record["program_stdout"] = output(exec_args([path + "/hello"]))
-            if record["program_stdout"] != "Hello dynamic derivations!":
-                record["validation_error"] = "unexpected hello output"
+            paths = result.stdout.strip().splitlines()
+            if len(paths) != 1 or not paths[0].startswith("/nix/store/"):
+                record["validation_error"] = "expected one store output"
+            else:
+                path = paths[0] + "/hello"
+                program = subprocess.run(exec_args([path]), text=True, capture_output=True)
+                record["program"] = {
+                    "path": path, "returncode": program.returncode,
+                    "stdout": program.stdout, "stderr": program.stderr,
+                }
+                if program.returncode or program.stdout.strip() != "Hello dynamic derivations!":
+                    record["validation_error"] = "unexpected hello result"
         (destination / f"hello-{attempt}.json").write_text(json.dumps(record, indent=2) + "\n")
         if record["returncode"] or "validation_error" in record:
             raise RuntimeError(f"baseline failed; see {destination}")

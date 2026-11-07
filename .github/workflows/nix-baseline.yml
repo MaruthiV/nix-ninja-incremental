@@ -1,0 +1,47 @@
+name: nix baseline
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - environment/**
+      - tools/dev.py
+      - .github/workflows/nix-baseline.yml
+  pull_request:
+    paths:
+      - environment/**
+      - tools/dev.py
+      - .github/workflows/nix-baseline.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-baseline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Pinned upstream source
+        run: python3 tools/dev.py prepare
+      - name: Isolated Nix daemon
+        run: python3 tools/dev.py up
+      - name: Environment manifest
+        run: python3 tools/dev.py info
+      - name: Fresh and warm example
+        run: python3 tools/dev.py baseline
+      - name: Setup records
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: nix-baseline-${{ github.run_id }}
+          path: results/setup/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Stop project daemon
+        if: always()
+        run: python3 tools/dev.py stop
