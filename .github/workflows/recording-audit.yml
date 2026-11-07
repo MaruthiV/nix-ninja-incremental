@@ -1,0 +1,69 @@
+name: recorded workload audit
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - environment/**
+      - patches/**
+      - tools/recording_audit.py
+      - tools/planning.py
+      - tools/workloads.py
+      - tools/input_view.py
+      - tools/realize.py
+      - .github/workflows/recording-audit.yml
+  pull_request:
+    paths:
+      - environment/**
+      - patches/**
+      - tools/recording_audit.py
+      - tools/planning.py
+      - tools/workloads.py
+      - tools/input_view.py
+      - tools/realize.py
+      - .github/workflows/recording-audit.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recorded-audit-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        workload: [zstd, nix]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Pinned recording variant
+        run: python3 tools/variants.py prepare recording
+      - name: Isolated Nix daemon
+        run: python3 tools/dev.py up
+      - name: Pinned Nix runtime
+        run: python3 tools/dev.py runtime
+      - name: Environment manifest
+        run: python3 tools/dev.py info
+      - name: Real workload recording eligibility
+        run: >-
+          python3 tools/dev.py exec -- nix-shell --impure
+          --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).nixWorkload.shell'
+          --run 'python3 /workspace/tools/recording_audit.py ${{ matrix.workload }}'
+      - name: Audit records
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: recorded-audit-${{ matrix.workload }}-${{ github.run_id }}
+          path: |
+            results/setup/
+            results/workloads/
+            results/eligibility/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Stop project daemon
+        if: always()
+        run: python3 tools/dev.py stop

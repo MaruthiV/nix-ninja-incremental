@@ -1,5 +1,6 @@
 import argparse
 from collections import defaultdict
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -24,6 +25,21 @@ def resources():
     return {name: (root / name).read_text() for name in ["pids.events", "memory.events"]}
 
 
+def discovery_report(stderr, mode):
+    reports = [json.loads(line.removeprefix("NNI_DISCOVERY=")) for line in stderr.splitlines()
+               if line.startswith("NNI_DISCOVERY=")]
+    if len(reports) != 1:
+        raise RuntimeError("expected one discovery report from the planner")
+    report = reports[0]
+    if report["schema_version"] != 1 or report["mode"] != mode or not report["planning_complete"]:
+        raise RuntimeError("incomplete or incompatible discovery report")
+    if report["hits"] or report["candidate_mismatches"] or report["validation_errors"]:
+        raise RuntimeError("record-only discovery audit failed")
+    if mode == "record" and (report["namespace"] is None or report["publication"] != "published"):
+        raise RuntimeError("discovery recording did not publish state")
+    return report
+
+
 def measure(args):
     view = InputView(args.view)
     destination = args.output.resolve()
@@ -40,6 +56,15 @@ def measure(args):
             modes[name] = {"binary": str(binary), "sha256": sha256(binary), "profile": profile}
     if not modes:
         raise ValueError("at least one --binary or --profile mode is required")
+    configured = set()
+    for specification in args.discovery:
+        name, mode = specification.split("=", 1)
+        if name not in modes or name in configured or mode not in {"off", "record"}:
+            raise ValueError("discovery modes must uniquely name a binary and use off or record")
+        modes[name]["discovery"] = mode
+        configured.add(name)
+    if configured:
+        (destination / "cache").mkdir(mode=0o700)
     capture = json.loads((view.control / "capture.json").read_text())
     if not capture.get("passed"):
         raise ValueError("input-view configuration did not pass")
@@ -50,7 +75,8 @@ def measure(args):
         "jobs": args.jobs, "repetitions": args.repetitions, "seed": args.seed,
         "pins": json.loads((ROOT / "environment/pins.json").read_text()),
         "patch_series": json.loads((ROOT / "patches/series.json").read_text()),
-        "planner_cache": "absent", "store_state": "uncontrolled before warmups; warmups retained",
+        "planner_cache": "record-only; every action scans fresh" if configured else "absent",
+        "store_state": "uncontrolled before warmups; warmups retained",
         "machine": subprocess.check_output(["uname", "-sm"], text=True).strip(),
         "runs": [], "passed": False,
     }
@@ -58,6 +84,8 @@ def measure(args):
     for key in ["NIX_BUILD_TOP", "NIX_NINJA_DRV", "NIX_NINJA_PROFILE"]:
         env.pop(key, None)
     expected = None
+
+    controller = ExitStack()
 
     def invoke(name, round_number, warmup=False):
         nonlocal expected
@@ -69,10 +97,20 @@ def measure(args):
         if mode["profile"]:
             run_env["NIX_NINJA_PROFILE"] = str(phases)
         argv = [mode["binary"], "-C", str(view.root / "build"), f"-j{args.jobs}", "-t", "drv", workload["target"]]
+        discovery = mode.get("discovery")
+        if discovery is not None:
+            argv += ["--input-view", str(view.marker), "--discovery-mode", discovery,
+                     "--discovery-cache", str(destination / "cache" / name)]
         before = resources()
+        if discovery is not None:
+            controller.close()
         start = time.monotonic_ns()
-        process = subprocess.run(argv, env=run_env, text=True, capture_output=True)
-        elapsed = time.monotonic_ns() - start
+        try:
+            process = subprocess.run(argv, env=run_env, text=True, capture_output=True)
+            elapsed = time.monotonic_ns() - start
+        finally:
+            if discovery is not None:
+                controller.enter_context(view.lease())
         record = {
             "mode": name, "round": round_number, "warmup": warmup,
             "argv": argv, "returncode": process.returncode, "elapsed_ns": elapsed,
@@ -83,6 +121,13 @@ def measure(args):
         (destination / f"{stem}-stderr.log").write_text(process.stderr)
         if process.returncode:
             raise RuntimeError(f"planning failed: {stem}")
+        if discovery is not None:
+            record["discovery"] = discovery_report(process.stderr, discovery)
+            if discovery == "record" and not warmup:
+                initial = next(run["discovery"] for run in report["runs"]
+                               if run["mode"] == name and run["warmup"])
+                if initial["recorded_actions"] and not record["discovery"]["validated_candidates"]:
+                    raise RuntimeError(f"warm planning did not validate persisted records: {stem}")
         value = json.dumps(json.loads(process.stdout), sort_keys=True, separators=(",", ":")).encode()
         record["derivation_sha256"] = hashlib.sha256(value).hexdigest()
         if expected is None:
@@ -94,7 +139,8 @@ def measure(args):
         print(f"{stem}: {elapsed / 1e9:.6f}s, matching derivation", flush=True)
 
     try:
-        with view.lease():
+        with controller:
+            controller.enter_context(view.lease())
             start = time.monotonic_ns()
             view.validate_links()
             report["view_verification_ns"] = time.monotonic_ns() - start
@@ -117,6 +163,7 @@ def measure(args):
         raise
     finally:
         (destination / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+    return report
 
 
 def main():
@@ -124,6 +171,7 @@ def main():
     parser.add_argument("--view", required=True, type=Path)
     parser.add_argument("--binary", action="append", default=[], metavar="NAME=PATH")
     parser.add_argument("--profile", action="append", default=[], metavar="NAME=PATH")
+    parser.add_argument("--discovery", action="append", default=[], metavar="NAME=off|record")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--seed", type=int, default=2027)
