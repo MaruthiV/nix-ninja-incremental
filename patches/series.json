@@ -81,6 +81,24 @@
         "crates/deps-infer/src/c_include_parser.rs": "f87f36c5e89e6c158311549b917e935ed64a294bfac93ab124a9abef196ca567",
         "crates/nix-ninja/src/task.rs": "5b41beb70ee28af01111644423ffb934d66988c0459d14efe8a86998fdf2eff0"
       }
+    },
+    {
+      "file": "0009-recorded-discovery-state.patch",
+      "sha256": "b00acbe8e0b8402d5416c10147dddd662e4e89fcdd3a6eb280f219e61f681fcd",
+      "purpose": "persistence: owned versioned discovery records with mandatory fresh scanning and candidate audits; no build reuse",
+      "postimage_sha256": {
+        "crates/deps-infer/src/observations.rs": "f4fe104f8f96ac78386a447466038c9a768e85b7dd571b3f3b8c9ab6acf73499",
+        "crates/nix-ninja/src/build.rs": "f9649712c3e76928605ab6e790086839ac8fdf448f19a7321f0f3b550c25f285",
+        "crates/nix-ninja/src/cli.rs": "e583e1b4b3edbda9eed27aa4e2a65f35ac033da9310a242909b5fc42bb00da77",
+        "crates/nix-ninja/src/discovery.rs": "aaa1c45784196d4dac16767a58876214372d0733b6dba91f5cfcd11a9b2e1f65",
+        "crates/nix-ninja/src/discovery_bundle.rs": "480fdf3879ed8487af3176e94a3192876f1e8413deffb1c8e3044420eff67193",
+        "crates/nix-ninja/src/discovery_identity.rs": "b5a9ce3c15d36f868ccafb64f1a39d4547484171656c5bbcd4daa4f9d7de0bbd",
+        "crates/nix-ninja/src/discovery_policy.rs": "d5ed2d0ecc6862f4e3f174de9df6908ea332cf4af4792d6bbdf9b508fecf9466",
+        "crates/nix-ninja/src/discovery_state.rs": "96d49b988e14c0c9c53e62fc3aa522636535cd44b0cde754e8ce13c5edeb663d",
+        "crates/nix-ninja/src/input_view.rs": "5bbc97065d5ff804198b6ece3bef9dab35340d659b906dbaba16bf9fb3207241",
+        "crates/nix-ninja/src/lib.rs": "8f1707c597553be70a262edbe5471cd0266787ad699fc4b2168d0ccdf2efdd6f",
+        "crates/nix-ninja/src/task.rs": "8188dce87894c920f6a7c6f6a1677d57c8083d919b6aa54ac5a3bdf783d30afe"
+      }
     }
   ],
   "variants": {
@@ -134,6 +152,15 @@
       "0005-discovery-observations.patch",
       "0007-observed-embedded-resources.patch",
       "0008-logical-dependency-paths.patch"
+    ],
+    "recording": [
+      "0001-scoped-path-resolution.patch",
+      "0003-bounded-planning.patch",
+      "0004-compiler-wrapper-environment.patch",
+      "0005-discovery-observations.patch",
+      "0007-observed-embedded-resources.patch",
+      "0008-logical-dependency-paths.patch",
+      "0009-recorded-discovery-state.patch"
     ]
   },
   "variant_postimages": {
@@ -193,6 +220,25 @@
       "crates/deps-infer/src/lib.rs": "971ac1e596dbdcd2d63a6d5d71dbfef2074d4f092c352ee41656361c342e86bc",
       "crates/deps-infer/src/observations.rs": "fddb1ea4284543375b09bd095a6840f319f27af4894a929183a526304c608fa7",
       "crates/deps-infer/src/gcc_include_parser.rs": "5fdee09c0cc3f1dd2bd097051e37c0357d178f940dc06a1f4dce05a26e45c126"
+    },
+    "recording": {
+      "crates/deps-infer/src/c_include_parser.rs": "f87f36c5e89e6c158311549b917e935ed64a294bfac93ab124a9abef196ca567",
+      "crates/nix-ninja/src/build.rs": "f9649712c3e76928605ab6e790086839ac8fdf448f19a7321f0f3b550c25f285",
+      "crates/nix-ninja/src/cli.rs": "e583e1b4b3edbda9eed27aa4e2a65f35ac033da9310a242909b5fc42bb00da77",
+      "crates/nix-ninja/src/task.rs": "8188dce87894c920f6a7c6f6a1677d57c8083d919b6aa54ac5a3bdf783d30afe",
+      "Cargo.lock": "af11193fe1b93126fd453e80101c24480ce0b726d67d7770dc5bdb90c7ea237b",
+      "crates/deps-infer/Cargo.toml": "9b1a75e3a06c72d4aeaa012c1f189173c89180a54166a9856c9f7224d661926a",
+      "crates/deps-infer/examples/trace_cost.rs": "0b38400ee93aafac310be4b57ef22e29e6a4e757b0f90d7684c7488ff10eca13",
+      "crates/deps-infer/src/lib.rs": "971ac1e596dbdcd2d63a6d5d71dbfef2074d4f092c352ee41656361c342e86bc",
+      "crates/deps-infer/src/observations.rs": "f4fe104f8f96ac78386a447466038c9a768e85b7dd571b3f3b8c9ab6acf73499",
+      "crates/deps-infer/src/gcc_include_parser.rs": "5fdee09c0cc3f1dd2bd097051e37c0357d178f940dc06a1f4dce05a26e45c126",
+      "crates/nix-ninja/src/discovery.rs": "aaa1c45784196d4dac16767a58876214372d0733b6dba91f5cfcd11a9b2e1f65",
+      "crates/nix-ninja/src/discovery_bundle.rs": "480fdf3879ed8487af3176e94a3192876f1e8413deffb1c8e3044420eff67193",
+      "crates/nix-ninja/src/discovery_identity.rs": "b5a9ce3c15d36f868ccafb64f1a39d4547484171656c5bbcd4daa4f9d7de0bbd",
+      "crates/nix-ninja/src/discovery_policy.rs": "d5ed2d0ecc6862f4e3f174de9df6908ea332cf4af4792d6bbdf9b508fecf9466",
+      "crates/nix-ninja/src/discovery_state.rs": "96d49b988e14c0c9c53e62fc3aa522636535cd44b0cde754e8ce13c5edeb663d",
+      "crates/nix-ninja/src/input_view.rs": "5bbc97065d5ff804198b6ece3bef9dab35340d659b906dbaba16bf9fb3207241",
+      "crates/nix-ninja/src/lib.rs": "8f1707c597553be70a262edbe5471cd0266787ad699fc4b2168d0ccdf2efdd6f"
     }
   }
 }

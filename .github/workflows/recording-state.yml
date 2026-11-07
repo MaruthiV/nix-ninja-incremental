@@ -1,0 +1,65 @@
+name: recorded planning
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - environment/**
+      - patches/**
+      - tools/build_oracle.py
+      - tools/input_view.py
+      - tests/fixtures/build_edits.json
+      - tests/fixtures/alias_build_edits.json
+      - tests/recording_checks.py
+      - .github/workflows/recording-state.yml
+  pull_request:
+    paths:
+      - environment/**
+      - patches/**
+      - tools/build_oracle.py
+      - tools/input_view.py
+      - tests/fixtures/build_edits.json
+      - tests/fixtures/alias_build_edits.json
+      - tests/recording_checks.py
+      - .github/workflows/recording-state.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recorded-planning-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Pinned recording variant
+        run: python3 tools/variants.py prepare recording
+      - name: Isolated Nix daemon
+        run: python3 tools/dev.py up
+      - name: Pinned Nix runtime
+        run: python3 tools/dev.py runtime
+      - name: Environment manifest
+        run: python3 tools/dev.py info
+      - name: Disabled and recording artifact oracles
+        run: >-
+          python3 tools/dev.py exec -- nix-shell --impure
+          --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).shell'
+          --run 'python3 /workspace/tests/recording_checks.py'
+      - name: Recording records
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: recorded-planning-${{ github.run_id }}
+          path: |
+            results/setup/
+            results/oracle/
+            results/recording/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Stop project daemon
+        if: always()
+        run: python3 tools/dev.py stop

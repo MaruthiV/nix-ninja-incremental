@@ -1,5 +1,5 @@
 import argparse
-from contextlib import closing
+from contextlib import closing, ExitStack
 import hashlib
 import json
 import os
@@ -107,7 +107,7 @@ def source_state(source):
     return state
 
 
-def campaign(binary, fixture_path, destination):
+def campaign(binary, fixture_path, destination, discovery_mode=None):
     fixture = json.loads(fixture_path.read_text())
     env = dict(os.environ)
     for key in ["NIX_BUILD_TOP", "NIX_NINJA_DRV", "NIX_NINJA_PROFILE"]:
@@ -124,11 +124,13 @@ def campaign(binary, fixture_path, destination):
         "ninja": invoke(["ninja", "--version"], env),
         "daemon": invoke(["nix", "store", "info", "--store", "daemon", "--json"], env),
         "steps": [], "passed": False,
+        "discovery_mode": discovery_mode,
     }
     try:
         view = InputView.create(provenance={"fixture_sha256": digest(fixture_path)})
         report["input_view"] = view.data
-        with closing(view), view.lease() as owned:
+        with closing(view), ExitStack() as controller:
+            owned = controller.enter_context(view.lease())
             source = owned / "source"
             source.mkdir()
             for name in fixture.get("directories", []):
@@ -139,6 +141,31 @@ def campaign(binary, fixture_path, destination):
             for build in [actual, reference]:
                 build.mkdir()
                 (build / "build.ninja").write_text(fixture["build_ninja"])
+
+            def planner(tool=None):
+                command = [str(binary), "-C", str(actual)]
+                if discovery_mode is not None:
+                    command += ["--input-view", str(view.marker), "--discovery-mode", discovery_mode,
+                                "--discovery-cache", str(view.control / "discovery")]
+                    controller.close()
+                if tool:
+                    command += ["-t", tool]
+                try:
+                    result = invoke([*command, fixture["target"]], env)
+                finally:
+                    if discovery_mode is not None:
+                        controller.enter_context(view.lease())
+                audit = None
+                if discovery_mode is not None:
+                    reports = [json.loads(line.removeprefix("NNI_DISCOVERY="))
+                               for line in result["stderr"].splitlines() if line.startswith("NNI_DISCOVERY=")]
+                    if len(reports) != 1:
+                        raise RuntimeError("expected one discovery report from the planner")
+                    audit = reports[0]
+                    if audit["mode"] != discovery_mode or audit["hits"] or audit["candidate_mismatches"]:
+                        raise RuntimeError("recording audit returned an unexpected reuse or mismatch")
+                return result, audit
+
             previous = None
             for edit in fixture["edits"]:
                 mutate(source, edit)
@@ -159,7 +186,14 @@ def campaign(binary, fixture_path, destination):
                     if outcome(stale) == outcome(expected):
                         raise RuntimeError("oracle did not detect an injected skipped rebuild")
                     step["stale_fault_detected"] = True
-                result = invoke([str(binary), "-C", str(actual), fixture["target"]], env)
+                result, audit = planner()
+                if discovery_mode is not None:
+                    step["discovery"] = audit
+                    if edit["expected_exit"] is not None:
+                        if not audit["planning_complete"]:
+                            raise RuntimeError("successful build did not complete planning")
+                        if discovery_mode == "record" and (audit["publication"] != "published" or not audit["recorded_actions"]):
+                            raise RuntimeError("successful build did not publish eligible discovery records")
                 observed = observe(actual, fixture["target"], result, env)
                 step.update(actual=result, actual_observation=observed)
                 if outcome(observed) != outcome(expected):
@@ -181,8 +215,19 @@ def campaign(binary, fixture_path, destination):
                     if edit.get("unchanged_artifact") and observed["sha256"] != previous:
                         raise RuntimeError("irrelevant edit changed the artifact")
                     previous = observed["sha256"]
+                    if discovery_mode is not None:
+                        probe, warm_audit = planner("drv")
+                        step.update(planning_probe=probe, warm_discovery=warm_audit)
+                        if probe["returncode"] or not warm_audit["planning_complete"]:
+                            raise RuntimeError("warm derivation subtool failed")
+                        value = json.dumps(json.loads(probe["stdout"]), sort_keys=True, separators=(",", ":")).encode()
+                        step["plan_sha256"] = hashlib.sha256(value).hexdigest()
+                        if discovery_mode == "record" and not warm_audit["validated_candidates"]:
+                            raise RuntimeError("warm derivation subtool did not audit persisted state")
                 step["passed"] = True
                 print(f"{edit['name']}: matched fresh build", flush=True)
+            if discovery_mode == "record" and not any(step["discovery"]["validated_candidates"] for step in report["steps"]):
+                raise RuntimeError("record campaign never validated a persisted candidate")
             report["passed"] = True
     except (OSError, ValueError, RuntimeError) as error:
         report["error"] = str(error)
@@ -196,13 +241,14 @@ def main():
     parser.add_argument("--binary", type=Path, default=shutil.which("nix-ninja"))
     parser.add_argument("--fixture", type=Path, default=ROOT / "tests/fixtures/build_edits.json")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--discovery-mode", choices=["off", "record"])
     args = parser.parse_args()
     if args.binary is None:
         parser.error("--binary or nix-ninja in PATH is required")
     binary = Path(args.binary).resolve(strict=True)
     destination = args.output or ROOT / "results/oracle" / f"build-{time.time_ns()}"
     destination.mkdir(parents=True, exist_ok=False)
-    campaign(binary, args.fixture, destination)
+    campaign(binary, args.fixture, destination, args.discovery_mode)
     print(destination)
 
 

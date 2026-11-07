@@ -1,0 +1,2992 @@
+diff --git a/crates/deps-infer/src/observations.rs b/crates/deps-infer/src/observations.rs
+index 5481721..7f172bb 100644
+--- a/crates/deps-infer/src/observations.rs
++++ b/crates/deps-infer/src/observations.rs
+@@ -105,6 +105,13 @@ impl ReadView {
+         depth: usize,
+     ) -> Result<Resolution> {
+         ensure!(depth <= 40, "symlink chain exceeds observation limit");
++        let bytes = path.as_os_str().as_encoded_bytes();
++        if bytes.ends_with(b"/") || bytes.ends_with(b"/.") {
++            ensure!(
++                fs::metadata(path)?.is_dir(),
++                "directory suffix on a non-directory"
++            );
++        }
+         if let Some(result) = memo.get(path) {
+             return Ok(result.clone());
+         }
+@@ -197,6 +204,10 @@ impl ReadView {
+             "file escapes stable roots: {}",
+             path.display()
+         );
++        ensure!(
++            self.resolve(path)?.as_deref() == Some(path),
++            "content observation requires a canonical stable path"
++        );
+         let mut memo = self.files.lock().unwrap();
+         if let Some(content) = memo.contents.get(path) {
+             if !retain || content.bytes.is_some() {
+@@ -252,6 +263,10 @@ impl ReadView {
+         Ok(self.content(path, false)?.digest)
+     }
+ 
++    pub fn bytes(&self, path: &Path) -> Result<Arc<Vec<u8>>> {
++        Ok(self.content(path, true)?.bytes.unwrap())
++    }
++
+     pub fn stats(&self) -> ReadStats {
+         let files = self.files.lock().unwrap();
+         ReadStats {
+@@ -511,4 +526,32 @@ mod tests {
+             assert_eq!(fixture.view().resolve(&query).unwrap(), None);
+         }
+     }
++
++    #[test]
++    fn directory_suffixes_cannot_alias_a_file_in_the_memo() {
++        let fixture = Fixture::new();
++        let file = fixture.write("value.h", "#define VALUE 1\n");
++        let query = file.join(".");
++        let view = fixture.view();
++        assert_eq!(view.resolve(&file).unwrap(), Some(file.clone()));
++        assert!(view.resolve(&query).is_err());
++        let view = fixture.view();
++        assert!(view.resolve(&query).is_err());
++        assert_eq!(view.resolve(&file).unwrap(), Some(file));
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn content_reads_require_canonical_confined_paths() {
++        let fixture = Fixture::new();
++        let other = Fixture::new();
++        let outside = other.write("outside.h", "int outside;\n");
++        let alias = fixture.0.join("alias.h");
++        std::os::unix::fs::symlink(&outside, &alias).unwrap();
++        let view = fixture.view();
++        assert!(view.bytes(&alias).is_err());
++        assert!(view.fingerprint(&alias).is_err());
++        let local = fixture.write("value.h", "int local;\n");
++        assert_eq!(view.bytes(&local).unwrap().as_slice(), b"int local;\n");
++    }
+ }
+diff --git a/crates/nix-ninja/src/build.rs b/crates/nix-ninja/src/build.rs
+index 1495ab8..2958803 100644
+--- a/crates/nix-ninja/src/build.rs
++++ b/crates/nix-ninja/src/build.rs
+@@ -16,6 +16,7 @@ pub struct BuildConfig {
+     pub store_dir: StoreDir,
+     pub is_output_derivation: bool,
+     pub jobs: usize,
++    pub discovery_options: Option<Arc<crate::discovery::Options>>,
+ }
+ 
+ pub fn build(
+@@ -36,6 +37,7 @@ pub fn build(
+             build_dir: config.build_dir,
+             store_dir: config.store_dir,
+             is_output_derivation: config.is_output_derivation,
++            discovery_options: config.discovery_options,
+         },
+     )?;
+     runner.read_build_dir(&mut loader.graph.files)?;
+@@ -61,7 +63,9 @@ pub fn build(
+         name
+     ))?;
+ 
+-    Ok(derived_file.clone())
++    let result = derived_file.clone();
++    runner.finish_discovery();
++    Ok(result)
+ }
+ 
+ fn load_file(build_filename: &str) -> Result<load::Loader> {
+diff --git a/crates/nix-ninja/src/cli.rs b/crates/nix-ninja/src/cli.rs
+index abe33f3..231dccb 100644
+--- a/crates/nix-ninja/src/cli.rs
++++ b/crates/nix-ninja/src/cli.rs
+@@ -1,4 +1,7 @@
+ use crate::build::{self, BuildConfig};
++use crate::discovery::{Mode, Options};
++use crate::discovery_identity::code_digest;
++use crate::input_view::InputViewLease;
+ use crate::local;
+ use crate::subtool::dynamic_task;
+ use anyhow::{anyhow, Context as _, Result};
+@@ -9,6 +12,7 @@ use harmonia_store_path::StoreDir;
+ use nix_builder_rpc_client::{aterm, BuilderRpcClient};
+ use nix_ninja_task::derived_file::DerivedFile;
+ use std::sync::Arc;
++use std::time::Instant;
+ use std::{
+     env,
+     path::{Path, PathBuf},
+@@ -56,6 +60,24 @@ pub struct Cli {
+     #[arg(long, default_value = "false", env = "NIX_NINJA_DRV", hide = true)]
+     pub is_output_derivation: bool,
+ 
++    #[arg(long, help = "Owned input-view descriptor for local planning")]
++    pub input_view: Option<PathBuf>,
++
++    #[arg(
++        long,
++        requires = "input_view",
++        help = "Local discovery state directory outside build inputs"
++    )]
++    pub discovery_cache: Option<PathBuf>,
++
++    #[arg(
++        long,
++        value_enum,
++        default_value = "off",
++        help = "Record mode audits candidates while always scanning fresh"
++    )]
++    pub discovery_mode: Mode,
++
+     /// Target to build (only used with certain subtools)
+     #[arg(trailing_var_arg = true)]
+     pub targets: Vec<String>,
+@@ -76,14 +98,22 @@ pub fn run() -> Result<()> {
+             .with_context(|| format!("set_current_dir({})", dir.display()))?;
+     }
+     let build_dir = std::env::current_dir().context("current_dir")?;
++    let discovery_options = discovery_options(&cli, &build_dir)?;
+ 
+     // Handle subtool if specified
+     if let Some(tool) = cli.tool.clone() {
+-        return subtool(&build_dir, &cli.store_dir, &tool, cli.targets.clone());
++        return subtool(
++            &cli,
++            &build_dir,
++            &cli.store_dir,
++            &tool,
++            cli.targets.clone(),
++            discovery_options,
++        );
+     }
+ 
+     let rpc_client = Arc::new(BuilderRpcClient::connect_from_env()?);
+-    let derived_file = build(&cli, &build_dir, &rpc_client)?;
++    let derived_file = build(&cli, &build_dir, &rpc_client, discovery_options.clone())?;
+     if cli.is_output_derivation {
+         submit_outer_output(&cli.store_dir, &derived_file, &rpc_client)?;
+     } else {
+@@ -127,12 +157,61 @@ fn submit_outer_output(
+     Ok(())
+ }
+ 
+-fn build(cli: &Cli, build_dir: &Path, rpc_client: &Arc<BuilderRpcClient>) -> Result<DerivedFile> {
++fn discovery_options(cli: &Cli, build_dir: &Path) -> Result<Option<Arc<Options>>> {
++    let Some(marker) = &cli.input_view else {
++        anyhow::ensure!(
++            cli.discovery_mode == Mode::Off,
++            "record mode requires --input-view and --discovery-cache"
++        );
++        return Ok(None);
++    };
++    anyhow::ensure!(
++        !cli.is_output_derivation,
++        "persistent discovery is only supported in local mode"
++    );
++    anyhow::ensure!(
++        cli.discovery_mode == Mode::Off || cli.discovery_cache.is_some(),
++        "record mode requires --discovery-cache"
++    );
++    let start = Instant::now();
++    let lease = InputViewLease::acquire(marker, build_dir)?;
++    let code_sha256 = if cli.discovery_mode == Mode::Record {
++        code_digest(&std::env::current_exe()?)?
++    } else {
++        String::new()
++    };
++    let ambient_search = [
++        "CPATH",
++        "C_INCLUDE_PATH",
++        "CPLUS_INCLUDE_PATH",
++        "OBJC_INCLUDE_PATH",
++        "GCC_EXEC_PREFIX",
++        "COMPILER_PATH",
++    ]
++    .iter()
++    .any(|name| env::var_os(name).is_some_and(|value| !value.is_empty()));
++    Ok(Some(Arc::new(Options {
++        lease,
++        mode: cli.discovery_mode,
++        cache_dir: cli.discovery_cache.clone(),
++        code_sha256,
++        ambient_search,
++        setup_ns: start.elapsed().as_nanos() as u64,
++    })))
++}
++
++fn build(
++    cli: &Cli,
++    build_dir: &Path,
++    rpc_client: &Arc<BuilderRpcClient>,
++    discovery_options: Option<Arc<Options>>,
++) -> Result<DerivedFile> {
+     let config = BuildConfig {
+         build_dir: build_dir.to_path_buf(),
+         store_dir: cli.store_dir.clone(),
+         is_output_derivation: cli.is_output_derivation,
+         jobs: cli.jobs,
++        discovery_options,
+     };
+ 
+     build::build(
+@@ -159,10 +238,12 @@ fn default_jobs() -> usize {
+ }
+ 
+ fn subtool(
++    cli: &Cli,
+     build_dir: &Path,
+     store_dir: &StoreDir,
+     subtool_name: &str,
+     targets: Vec<String>,
++    discovery_options: Option<Arc<Options>>,
+ ) -> Result<()> {
+     match subtool_name {
+         "list" => {
+@@ -172,9 +253,8 @@ fn subtool(
+             Ok(())
+         }
+         "drv" => {
+-            let cli = Cli::parse();
+             let rpc_client = Arc::new(BuilderRpcClient::connect_from_env()?);
+-            let derived_file = build(&cli, build_dir, &rpc_client)?;
++            let derived_file = build(cli, build_dir, &rpc_client, discovery_options.clone())?;
+             let drv_path = derived_file.derived_path.root_path();
+             let bytes = rpc_client.clone_drv(drv_path).ok_or_else(|| {
+                 anyhow!(
+diff --git a/crates/nix-ninja/src/discovery.rs b/crates/nix-ninja/src/discovery.rs
+new file mode 100644
+index 0000000..4161c4d
+--- /dev/null
++++ b/crates/nix-ninja/src/discovery.rs
+@@ -0,0 +1,612 @@
++use crate::discovery_bundle::{Bundle, Recorded, MAX_RECORDS};
++use crate::discovery_identity::{Identity, Namespace};
++use crate::discovery_policy::{self, CommandInputs, FilePolicy};
++use crate::discovery_state::{Directory, Loaded};
++use crate::input_view::InputViewLease;
++use anyhow::Result;
++use clap::ValueEnum;
++use deps_infer::c_include_parser::{
++    retrieve_c_dependency_paths, retrieve_c_dependency_paths_observed,
++};
++use deps_infer::observations::ReadView;
++use serde::Serialize;
++use std::collections::{BTreeMap, BTreeSet};
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::Instant;
++
++const MAX_CAPTURE_BYTES: usize = 384 * 1024 * 1024;
++
++#[derive(Clone, Copy, Default, PartialEq, ValueEnum)]
++pub enum Mode {
++    #[default]
++    Off,
++    Record,
++}
++
++pub struct Options {
++    pub lease: Arc<InputViewLease>,
++    pub mode: Mode,
++    pub cache_dir: Option<PathBuf>,
++    pub code_sha256: String,
++    pub ambient_search: bool,
++    pub setup_ns: u64,
++}
++
++struct State {
++    directory: Option<Directory>,
++    updates: BTreeMap<String, Recorded>,
++    used: BTreeSet<String>,
++    bypasses: BTreeMap<&'static str, u64>,
++    load: String,
++    publication: &'static str,
++    finished: bool,
++    captured_bytes: usize,
++}
++
++#[derive(Serialize)]
++pub struct Report {
++    schema_version: u32,
++    mode: &'static str,
++    namespace: Option<String>,
++    calls: u64,
++    hits: u64,
++    validated_candidates: u64,
++    candidate_mismatches: u64,
++    validation_errors: u64,
++    scans: u64,
++    bypasses: BTreeMap<&'static str, u64>,
++    loaded_records: usize,
++    recorded_actions: usize,
++    estimated_record_bytes: usize,
++    load: String,
++    publication: &'static str,
++    setup_ns: u64,
++    planning_complete: bool,
++    cumulative_discovery_ns: u64,
++    cumulative_validation_ns: u64,
++    publication_ns: u64,
++    observations: Option<deps_infer::observations::ReadStats>,
++}
++
++pub struct Discovery {
++    options: Arc<Options>,
++    identity: Option<Identity>,
++    view: Option<Arc<ReadView>>,
++    previous: Bundle,
++    wrappers: BTreeMap<String, String>,
++    tool_roots: Vec<PathBuf>,
++    policy: Mutex<FilePolicy>,
++    state: Mutex<State>,
++    calls: AtomicU64,
++    scans: AtomicU64,
++    discovery_ns: AtomicU64,
++    validation_ns: AtomicU64,
++    validated: AtomicU64,
++    mismatches: AtomicU64,
++    validation_errors: AtomicU64,
++    publication_ns: AtomicU64,
++    setup_ns: u64,
++}
++
++impl Discovery {
++    pub fn new(options: Arc<Options>, namespace: Namespace) -> Self {
++        let start = Instant::now();
++        let mut state = State {
++            directory: None,
++            updates: BTreeMap::new(),
++            used: BTreeSet::new(),
++            bypasses: BTreeMap::new(),
++            load: "disabled".into(),
++            publication: "not-finished",
++            finished: false,
++            captured_bytes: 0,
++        };
++        let mut identity = None;
++        let mut view = None;
++        let mut previous = Bundle::empty();
++        if options.mode == Mode::Record {
++            let prepared = (|| -> Result<_> {
++                let identity = Identity::new(&namespace)?;
++                let view = options.lease.read_view()?;
++                let directory = Directory::open(
++                    options
++                        .cache_dir
++                        .as_deref()
++                        .ok_or_else(|| anyhow::anyhow!("record mode requires a cache directory"))?,
++                    &options.lease.root,
++                )?;
++                Ok((identity, view, directory))
++            })();
++            match prepared {
++                Ok((key, reads, directory)) => {
++                    match directory.load(&key.namespace) {
++                        Ok(Loaded::Hit(payload)) => match Bundle::decode(&payload) {
++                            Ok(bundle) => {
++                                previous = bundle;
++                                state.load = "loaded".into();
++                            }
++                            Err(_) => {
++                                state.load = "invalid-bundle".into();
++                            }
++                        },
++                        Ok(Loaded::Miss(reason)) => state.load = reason.into(),
++                        Err(_) => state.load = "read-error".into(),
++                    }
++                    state.directory = Some(directory);
++                    identity = Some(key);
++                    view = Some(reads);
++                }
++                Err(_) => state.load = "setup-error".into(),
++            }
++        }
++        let setup_ns = options
++            .setup_ns
++            .saturating_add(start.elapsed().as_nanos() as u64);
++        Self {
++            options,
++            identity,
++            view,
++            previous,
++            wrappers: namespace.wrapper_vars,
++            tool_roots: namespace.tools.into_values().map(PathBuf::from).collect(),
++            policy: Mutex::default(),
++            state: Mutex::new(state),
++            calls: AtomicU64::new(0),
++            scans: AtomicU64::new(0),
++            discovery_ns: AtomicU64::new(0),
++            validation_ns: AtomicU64::new(0),
++            validated: AtomicU64::new(0),
++            mismatches: AtomicU64::new(0),
++            validation_errors: AtomicU64::new(0),
++            publication_ns: AtomicU64::new(0),
++            setup_ns,
++        }
++    }
++
++    fn bypass(&self, reason: &'static str) {
++        *self
++            .state
++            .lock()
++            .unwrap()
++            .bypasses
++            .entry(reason)
++            .or_default() += 1;
++    }
++
++    fn fresh(&self, command: &str, seeds: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
++        self.scans.fetch_add(1, Ordering::Relaxed);
++        retrieve_c_dependency_paths(command, seeds, None)
++    }
++
++    pub fn discover(
++        &self,
++        command: &str,
++        seeds: Vec<PathBuf>,
++        store_inputs: &[PathBuf],
++        generated: bool,
++    ) -> Result<Vec<PathBuf>> {
++        if generated {
++            let start = Instant::now();
++            self.calls.fetch_add(1, Ordering::Relaxed);
++            self.bypass("generated-input");
++            let result = self.fresh(command, seeds);
++            self.discovery_ns
++                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
++            return result;
++        }
++        if self.options.mode == Mode::Off || self.identity.is_none() {
++            return self.discover_resolved(command, seeds, store_inputs, None);
++        }
++        let compiler = shell_words::split(command)
++            .ok()
++            .and_then(|args| args.first().and_then(|name| which::which(name).ok()))
++            .and_then(|path| path.canonicalize().ok());
++        self.discover_resolved(command, seeds, store_inputs, compiler.as_deref())
++    }
++
++    fn discover_resolved(
++        &self,
++        command: &str,
++        seeds: Vec<PathBuf>,
++        store_inputs: &[PathBuf],
++        compiler: Option<&Path>,
++    ) -> Result<Vec<PathBuf>> {
++        let start = Instant::now();
++        self.calls.fetch_add(1, Ordering::Relaxed);
++        let result = (|| {
++            if self.options.mode == Mode::Off {
++                return self.fresh(command, seeds);
++            }
++            let (Some(identity), Some(view), Some(compiler)) =
++                (&self.identity, &self.view, compiler)
++            else {
++                self.bypass("unavailable-cache-or-compiler");
++                return self.fresh(command, seeds);
++            };
++            let mut roots = self.tool_roots.clone();
++            roots.extend_from_slice(store_inputs);
++            let action = CommandInputs {
++                command,
++                seeds: &seeds,
++                cwd: &self.options.lease.cwd,
++                compiler,
++                store_inputs: &roots,
++                wrapper_vars: &self.wrappers,
++                ambient_search: self.options.ambient_search,
++            };
++            let policy = match discovery_policy::command(&action, view) {
++                Ok(value) => value,
++                Err(reason) => {
++                    self.bypass(reason);
++                    return self.fresh(command, seeds);
++                }
++            };
++            let key = identity.action(command, &seeds, compiler)?;
++            let validation_start = Instant::now();
++            let candidate = match self.previous.lookup(&key, view) {
++                Ok(value) => value,
++                Err(_) => {
++                    self.validation_errors.fetch_add(1, Ordering::Relaxed);
++                    None
++                }
++            };
++            self.validation_ns.fetch_add(
++                validation_start.elapsed().as_nanos() as u64,
++                Ordering::Relaxed,
++            );
++            self.scans.fetch_add(1, Ordering::Relaxed);
++            let (dependencies, mut trace) =
++                match retrieve_c_dependency_paths_observed(command, seeds.clone(), view.clone()) {
++                    Ok(value) => value,
++                    Err(_) => {
++                        self.bypass("observation-error");
++                        return self.fresh(command, seeds);
++                    }
++                };
++            trace.resolutions.extend(policy.trace.resolutions);
++            if let Err(reason) = self.policy.lock().unwrap().trace(view, &trace) {
++                self.bypass(reason);
++                return Ok(dependencies);
++            }
++            if let Some(candidate) = candidate {
++                self.validated.fetch_add(1, Ordering::Relaxed);
++                if BTreeSet::from_iter(candidate)
++                    != BTreeSet::from_iter(dependencies.iter().cloned())
++                {
++                    self.mismatches.fetch_add(1, Ordering::Relaxed);
++                }
++            }
++            let mut state = self.state.lock().unwrap();
++            if state.finished {
++                state.publication = "late-discovery";
++                return Ok(dependencies);
++            }
++            let record = Recorded {
++                dependencies: dependencies.clone(),
++                trace,
++            };
++            let previous_bytes = state
++                .updates
++                .get(&key)
++                .map(Recorded::estimated_bytes)
++                .unwrap_or(0);
++            let captured_bytes = state
++                .captured_bytes
++                .saturating_sub(previous_bytes)
++                .saturating_add(record.estimated_bytes());
++            if captured_bytes > MAX_CAPTURE_BYTES
++                || (!state.used.contains(&key) && state.used.len() >= MAX_RECORDS)
++            {
++                *state.bypasses.entry("record-budget").or_default() += 1;
++                return Ok(dependencies);
++            }
++            state.captured_bytes = captured_bytes;
++            state.used.insert(key.clone());
++            state.updates.insert(key, record);
++            Ok(dependencies)
++        })();
++        self.discovery_ns
++            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
++        result
++    }
++
++    pub fn finish(&self) {
++        let start = Instant::now();
++        let mut state = self.state.lock().unwrap();
++        if state.finished {
++            return;
++        }
++        state.finished = true;
++        if self.options.mode == Mode::Off {
++            state.publication = "disabled";
++            return;
++        }
++        let Some(identity) = &self.identity else {
++            state.publication = "disabled";
++            return;
++        };
++        let payload = self
++            .previous
++            .updated(&state.updates, &state.used)
++            .and_then(|bundle| bundle.encode());
++        state.publication = match payload {
++            Ok(payload) => match state.directory.as_mut() {
++                Some(directory) => match directory.publish(&identity.namespace, &payload) {
++                    Ok(()) => "published",
++                    Err(_) => "write-error",
++                },
++                None => "disabled",
++            },
++            Err(_) => "bundle-error",
++        };
++        self.publication_ns
++            .store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
++    }
++
++    pub fn report(&self) -> Report {
++        let state = self.state.lock().unwrap();
++        Report {
++            schema_version: 1,
++            mode: if self.options.mode == Mode::Off {
++                "off"
++            } else {
++                "record"
++            },
++            namespace: self
++                .identity
++                .as_ref()
++                .map(|identity| identity.namespace.clone()),
++            calls: self.calls.load(Ordering::Relaxed),
++            hits: 0,
++            validated_candidates: self.validated.load(Ordering::Relaxed),
++            candidate_mismatches: self.mismatches.load(Ordering::Relaxed),
++            validation_errors: self.validation_errors.load(Ordering::Relaxed),
++            scans: self.scans.load(Ordering::Relaxed),
++            bypasses: state.bypasses.clone(),
++            loaded_records: self.previous.counts().records,
++            recorded_actions: state.used.len(),
++            estimated_record_bytes: state.captured_bytes,
++            load: state.load.clone(),
++            publication: state.publication,
++            setup_ns: self.setup_ns,
++            planning_complete: state.finished,
++            cumulative_discovery_ns: self.discovery_ns.load(Ordering::Relaxed),
++            cumulative_validation_ns: self.validation_ns.load(Ordering::Relaxed),
++            publication_ns: self.publication_ns.load(Ordering::Relaxed),
++            observations: self.view.as_ref().map(|view| view.stats()),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::fs;
++    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
++    use std::sync::atomic::{AtomicU64, Ordering};
++
++    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
++    struct Fixture(PathBuf);
++    impl Fixture {
++        fn new() -> Self {
++            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
++            let root =
++                std::env::temp_dir().join(format!("nni-discovery-{}-{id}", std::process::id()));
++            fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
++            let value = Self(root.canonicalize().unwrap());
++            fs::DirBuilder::new()
++                .mode(0o700)
++                .create(value.0.join("view"))
++                .unwrap();
++            fs::create_dir(value.root()).unwrap();
++            fs::create_dir(value.cwd()).unwrap();
++            let data =
++                serde_json::json!({"schema_version":1,"id":"b".repeat(32),"root":value.root()});
++            for (name, bytes) in [
++                ("view.json", serde_json::to_vec(&data).unwrap()),
++                ("view.lock", Vec::new()),
++            ] {
++                let path = value.0.join("view").join(name);
++                fs::write(&path, bytes).unwrap();
++                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
++            }
++            value
++        }
++        fn root(&self) -> PathBuf {
++            self.0.join("view/inputs")
++        }
++        fn cwd(&self) -> PathBuf {
++            self.root().join("build")
++        }
++        fn write(&self, name: &str, bytes: &str) -> PathBuf {
++            let path = self.cwd().join(name);
++            fs::write(&path, bytes).unwrap();
++            path
++        }
++        fn context(&self, mode: Mode) -> Discovery {
++            let deadline = Instant::now() + std::time::Duration::from_secs(2);
++            loop {
++                if let Some(context) = self.try_context(mode) {
++                    if mode == Mode::Off || context.report().load != "setup-error" {
++                        return context;
++                    }
++                }
++                assert!(Instant::now() < deadline, "released context remained busy");
++                std::thread::sleep(std::time::Duration::from_millis(5));
++            }
++        }
++
++        fn try_context(&self, mode: Mode) -> Option<Discovery> {
++            let lease =
++                InputViewLease::acquire(&self.0.join("view/view.json"), &self.cwd()).ok()?;
++            let namespace = Namespace {
++                code_sha256: "a".repeat(64),
++                view_id: lease.id.clone(),
++                root: lease.root.clone(),
++                cwd: lease.cwd.clone(),
++                system: "x86_64-linux".into(),
++                store_dir: "/nix/store".into(),
++                tools: [
++                    "cc",
++                    "coreutils",
++                    "nix",
++                    "nix-ninja",
++                    "nix-ninja-task",
++                    "patchelf",
++                ]
++                .into_iter()
++                .map(|name| {
++                    (
++                        name.into(),
++                        format!("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-{name}"),
++                    )
++                })
++                .collect(),
++                wrapper_vars: BTreeMap::new(),
++                search_path: "/nix/store/cc/bin".into(),
++            };
++            let options = Arc::new(Options {
++                lease,
++                mode,
++                cache_dir: Some(self.0.join("state")),
++                code_sha256: namespace.code_sha256.clone(),
++                ambient_search: false,
++                setup_ns: 0,
++            });
++            let context = Discovery::new(options, namespace);
++            Some(context)
++        }
++        fn scan(&self, context: &Discovery) -> Vec<PathBuf> {
++            context
++                .discover_resolved(
++                    "cc -c main.c",
++                    vec![self.cwd().join("main.c")],
++                    &[],
++                    Some(Path::new(
++                        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-cc/bin/cc",
++                    )),
++                )
++                .unwrap()
++        }
++    }
++    impl Drop for Fixture {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.0);
++        }
++    }
++
++    #[test]
++    fn record_mode_publishes_complete_plans_but_always_scans() {
++        let fixture = Fixture::new();
++        let main = fixture.write("main.c", "#include \"value.h\"\n");
++        let header = fixture.write("value.h", "int value;\n");
++        let context = fixture.context(Mode::Record);
++        assert_eq!(context.options.code_sha256, "a".repeat(64));
++        assert_eq!(
++            HashSet::from_iter(fixture.scan(&context)),
++            HashSet::from([main.clone(), header.clone()])
++        );
++        context.finish();
++        assert_eq!(context.report().publication, "published");
++        drop(context);
++        let context = fixture.context(Mode::Record);
++        assert_eq!(context.report().loaded_records, 1);
++        fixture.scan(&context);
++        assert_eq!(context.report().scans, 1);
++        assert_eq!(context.report().hits, 0);
++        assert_eq!(context.report().validated_candidates, 1);
++        assert_eq!(context.report().candidate_mismatches, 0);
++        context.finish();
++        drop(context);
++        fixture.write("main.c", "#include \"other.h\"\n");
++        let other = fixture.write("other.h", "int other;\n");
++        let context = fixture.context(Mode::Record);
++        assert_eq!(
++            HashSet::from_iter(fixture.scan(&context)),
++            HashSet::from([main, other])
++        );
++        context.finish();
++        assert_eq!(context.report().recorded_actions, 1);
++    }
++
++    #[test]
++    fn disabled_or_unfinished_plans_do_not_publish_and_unsupported_inputs_bypass() {
++        let fixture = Fixture::new();
++        fixture.write("main.c", "#include PICK\n");
++        let context = fixture.context(Mode::Off);
++        fixture.scan(&context);
++        context.finish();
++        assert!(!fixture.0.join("state").exists());
++        drop(context);
++        let context = fixture.context(Mode::Record);
++        fixture.scan(&context);
++        assert_eq!(context.report().bypasses["computed-dependency"], 1);
++        drop(context);
++        assert!(!fixture.0.join("state/state.json").exists());
++        let context = fixture.context(Mode::Off);
++        context
++            .discover("cc", vec![fixture.cwd().join("main.c")], &[], false)
++            .unwrap();
++        assert_eq!(context.report().calls, 1);
++    }
++
++    #[test]
++    fn candidate_auditing_detects_an_injected_wrong_dependency_value() {
++        let fixture = Fixture::new();
++        let main = fixture.write("main.c", "int value;\n");
++        let context = fixture.context(Mode::Record);
++        fixture.scan(&context);
++        context
++            .state
++            .lock()
++            .unwrap()
++            .updates
++            .values_mut()
++            .next()
++            .unwrap()
++            .dependencies
++            .clear();
++        context.finish();
++        drop(context);
++        let context = fixture.context(Mode::Record);
++        assert_eq!(fixture.scan(&context), vec![main]);
++        assert_eq!(context.report().candidate_mismatches, 1);
++        assert_eq!(context.report().hits, 0);
++        context.finish();
++    }
++
++    #[test]
++    fn exhausted_capture_budget_keeps_fresh_results() {
++        let fixture = Fixture::new();
++        let main = fixture.write("main.c", "int value;\n");
++        let context = fixture.context(Mode::Record);
++        context.state.lock().unwrap().captured_bytes = MAX_CAPTURE_BYTES;
++        assert_eq!(fixture.scan(&context), vec![main]);
++        assert_eq!(context.report().bypasses["record-budget"], 1);
++        assert_eq!(context.report().recorded_actions, 0);
++        context.finish();
++    }
++
++    #[test]
++    fn unavailable_state_falls_back_without_claiming_an_unowned_directory() {
++        let fixture = Fixture::new();
++        let main = fixture.write("main.c", "int value;\n");
++        fs::DirBuilder::new()
++            .mode(0o700)
++            .create(fixture.0.join("state"))
++            .unwrap();
++        let unrelated = fixture.0.join("state/unrelated");
++        fs::write(&unrelated, b"keep this").unwrap();
++        let context = fixture.try_context(Mode::Record).unwrap();
++        assert_eq!(context.report().load, "setup-error");
++        assert_eq!(fixture.scan(&context), vec![main]);
++        context.finish();
++        assert_eq!(context.report().publication, "disabled");
++        assert_eq!(fs::read(unrelated).unwrap(), b"keep this");
++        assert!(!fixture.0.join("state/state.json").exists());
++    }
++
++    use std::collections::HashSet;
++}
+diff --git a/crates/nix-ninja/src/discovery_bundle.rs b/crates/nix-ninja/src/discovery_bundle.rs
+new file mode 100644
+index 0000000..2bf1e78
+--- /dev/null
++++ b/crates/nix-ninja/src/discovery_bundle.rs
+@@ -0,0 +1,506 @@
++use anyhow::{ensure, Context, Result};
++use deps_infer::observations::{DiscoveryTrace, ReadView};
++use serde::{Deserialize, Serialize};
++use std::collections::{BTreeMap, BTreeSet, HashMap};
++use std::path::{Path, PathBuf};
++
++const MAX_PATHS: usize = 1_000_000;
++const MAX_OBSERVATIONS: usize = 2_000_000;
++pub const MAX_RECORDS: usize = 16_384;
++
++pub struct Recorded {
++    pub dependencies: Vec<PathBuf>,
++    pub trace: DiscoveryTrace,
++}
++
++impl Recorded {
++    pub fn estimated_bytes(&self) -> usize {
++        let path_bytes = |path: &Path| path.as_os_str().as_encoded_bytes().len().saturating_add(64);
++        let dependencies = self.dependencies.iter().map(|path| path_bytes(path));
++        let resolutions = self.trace.resolutions.iter().map(|(path, target)| {
++            path_bytes(path).saturating_add(target.as_deref().map(path_bytes).unwrap_or(0))
++        });
++        let files = self.trace.files.iter().map(|(path, hash)| {
++            path_bytes(path)
++                .saturating_add(hash.len())
++                .saturating_add(64)
++        });
++        dependencies
++            .chain(resolutions)
++            .chain(files)
++            .fold(128, usize::saturating_add)
++    }
++}
++
++#[derive(Serialize, Deserialize)]
++struct Entry {
++    key: String,
++    dependencies: Vec<u32>,
++    resolutions: Vec<u32>,
++    files: Vec<u32>,
++}
++
++#[derive(Serialize, Deserialize)]
++pub struct Bundle {
++    version: u32,
++    paths: Vec<PathBuf>,
++    resolutions: Vec<(u32, Option<u32>)>,
++    files: Vec<(u32, String)>,
++    records: BTreeMap<String, Entry>,
++}
++
++#[derive(Serialize)]
++pub struct Counts {
++    pub paths: usize,
++    pub resolutions: usize,
++    pub files: usize,
++    pub records: usize,
++}
++
++fn digest(value: &str) -> bool {
++    value.len() == 64
++        && value
++            .bytes()
++            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++}
++
++impl Bundle {
++    pub fn empty() -> Self {
++        Self {
++            version: 1,
++            paths: Vec::new(),
++            resolutions: Vec::new(),
++            files: Vec::new(),
++            records: BTreeMap::new(),
++        }
++    }
++
++    pub fn decode(payload: &str) -> Result<Self> {
++        let bundle: Self = serde_json::from_str(payload)?;
++        bundle.check()?;
++        Ok(bundle)
++    }
++
++    pub fn encode(&self) -> Result<String> {
++        self.check()?;
++        Ok(serde_json::to_string(self)?)
++    }
++
++    fn path(&self, id: u32) -> Result<&Path> {
++        self.paths
++            .get(id as usize)
++            .map(PathBuf::as_path)
++            .context("invalid path index")
++    }
++
++    fn check(&self) -> Result<()> {
++        ensure!(self.version == 1, "unsupported dependency bundle version");
++        ensure!(
++            self.paths.len() <= MAX_PATHS && self.records.len() <= MAX_RECORDS,
++            "bundle exceeds index budget"
++        );
++        ensure!(
++            self.resolutions.len() <= MAX_OBSERVATIONS && self.files.len() <= MAX_OBSERVATIONS,
++            "bundle exceeds observation budget"
++        );
++        for (path, target) in &self.resolutions {
++            ensure!(
++                self.path(*path)?.is_absolute(),
++                "resolution path must be absolute"
++            );
++            if let Some(target) = target {
++                ensure!(
++                    self.path(*target)?.is_absolute(),
++                    "resolution target must be absolute"
++                );
++            }
++        }
++        for (path, hash) in &self.files {
++            ensure!(
++                self.path(*path)?.is_absolute() && digest(hash),
++                "invalid file observation"
++            );
++        }
++        for (key, record) in &self.records {
++            ensure!(digest(key) && key == &record.key, "record key mismatch");
++            for id in &record.dependencies {
++                self.path(*id)?;
++            }
++            for id in &record.resolutions {
++                ensure!(
++                    (*id as usize) < self.resolutions.len(),
++                    "invalid resolution index"
++                );
++            }
++            for id in &record.files {
++                ensure!((*id as usize) < self.files.len(), "invalid file index");
++            }
++        }
++        Ok(())
++    }
++
++    pub fn lookup(&self, key: &str, view: &ReadView) -> Result<Option<Vec<PathBuf>>> {
++        let Some(record) = self.records.get(key) else {
++            return Ok(None);
++        };
++        for id in &record.resolutions {
++            let (path, target) = self.resolutions[*id as usize];
++            let target = target.map(|id| self.path(id)).transpose()?;
++            if view.resolve(self.path(path)?)?.as_deref() != target {
++                return Ok(None);
++            }
++        }
++        for id in &record.files {
++            let (path, hash) = &self.files[*id as usize];
++            if &view.fingerprint(self.path(*path)?)? != hash {
++                return Ok(None);
++            }
++        }
++        Ok(Some(
++            record
++                .dependencies
++                .iter()
++                .map(|id| self.path(*id).map(Path::to_owned))
++                .collect::<Result<_>>()?,
++        ))
++    }
++
++    pub fn updated(
++        &self,
++        updates: &BTreeMap<String, Recorded>,
++        used: &BTreeSet<String>,
++    ) -> Result<Self> {
++        ensure!(used.len() <= MAX_RECORDS, "too many dependency records");
++        let mut packed = Packer::new();
++        for key in used {
++            let record = if let Some(record) = updates.get(key) {
++                let dependencies = record
++                    .dependencies
++                    .iter()
++                    .map(|path| packed.path(path))
++                    .collect::<Result<_>>()?;
++                let resolutions = record
++                    .trace
++                    .resolutions
++                    .iter()
++                    .map(|(path, target)| packed.resolution(path, target.as_deref()))
++                    .collect::<Result<_>>()?;
++                let files = record
++                    .trace
++                    .files
++                    .iter()
++                    .map(|(path, hash)| packed.file(path, hash))
++                    .collect::<Result<_>>()?;
++                Entry {
++                    key: key.clone(),
++                    dependencies,
++                    resolutions,
++                    files,
++                }
++            } else {
++                let record = self
++                    .records
++                    .get(key)
++                    .context("used key has no saved or fresh record")?;
++                let dependencies = record
++                    .dependencies
++                    .iter()
++                    .map(|id| packed.path(self.path(*id)?))
++                    .collect::<Result<_>>()?;
++                let resolutions = record
++                    .resolutions
++                    .iter()
++                    .map(|id| {
++                        let (path, target) = self.resolutions[*id as usize];
++                        packed.resolution(
++                            self.path(path)?,
++                            target.map(|id| self.path(id)).transpose()?,
++                        )
++                    })
++                    .collect::<Result<_>>()?;
++                let files = record
++                    .files
++                    .iter()
++                    .map(|id| {
++                        let (path, hash) = &self.files[*id as usize];
++                        packed.file(self.path(*path)?, hash)
++                    })
++                    .collect::<Result<_>>()?;
++                Entry {
++                    key: key.clone(),
++                    dependencies,
++                    resolutions,
++                    files,
++                }
++            };
++            packed.bundle.records.insert(key.clone(), record);
++        }
++        packed.bundle.check()?;
++        Ok(packed.bundle)
++    }
++
++    pub fn counts(&self) -> Counts {
++        Counts {
++            paths: self.paths.len(),
++            resolutions: self.resolutions.len(),
++            files: self.files.len(),
++            records: self.records.len(),
++        }
++    }
++}
++
++struct Packer {
++    bundle: Bundle,
++    paths: HashMap<PathBuf, u32>,
++    resolutions: HashMap<PathBuf, u32>,
++    files: HashMap<PathBuf, u32>,
++}
++
++impl Packer {
++    fn new() -> Self {
++        Self {
++            bundle: Bundle::empty(),
++            paths: HashMap::new(),
++            resolutions: HashMap::new(),
++            files: HashMap::new(),
++        }
++    }
++
++    fn path(&mut self, path: &Path) -> Result<u32> {
++        if let Some(id) = self.paths.get(path) {
++            return Ok(*id);
++        }
++        ensure!(
++            self.bundle.paths.len() < MAX_PATHS,
++            "too many dependency paths"
++        );
++        let id = u32::try_from(self.bundle.paths.len())?;
++        self.bundle.paths.push(path.to_owned());
++        self.paths.insert(path.to_owned(), id);
++        Ok(id)
++    }
++
++    fn resolution(&mut self, path: &Path, target: Option<&Path>) -> Result<u32> {
++        let value = (
++            self.path(path)?,
++            target.map(|path| self.path(path)).transpose()?,
++        );
++        if let Some(id) = self.resolutions.get(path) {
++            ensure!(
++                self.bundle.resolutions[*id as usize] == value,
++                "conflicting resolution observations"
++            );
++            return Ok(*id);
++        }
++        ensure!(
++            self.bundle.resolutions.len() < MAX_OBSERVATIONS,
++            "too many resolution observations"
++        );
++        let id = u32::try_from(self.bundle.resolutions.len())?;
++        self.bundle.resolutions.push(value);
++        self.resolutions.insert(path.to_owned(), id);
++        Ok(id)
++    }
++
++    fn file(&mut self, path: &Path, hash: &str) -> Result<u32> {
++        let path_id = self.path(path)?;
++        if let Some(id) = self.files.get(path) {
++            ensure!(
++                self.bundle.files[*id as usize] == (path_id, hash.to_owned()),
++                "conflicting file observations"
++            );
++            return Ok(*id);
++        }
++        ensure!(
++            self.bundle.files.len() < MAX_OBSERVATIONS,
++            "too many file observations"
++        );
++        let id = u32::try_from(self.bundle.files.len())?;
++        self.bundle.files.push((path_id, hash.to_owned()));
++        self.files.insert(path.to_owned(), id);
++        Ok(id)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use deps_infer::c_include_parser::retrieve_c_dependency_paths_observed;
++    use std::fs;
++    use std::sync::atomic::{AtomicU64, Ordering};
++    use std::sync::Arc;
++
++    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
++
++    struct Fixture(PathBuf);
++
++    impl Fixture {
++        fn new() -> Self {
++            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
++            let path = std::env::temp_dir().join(format!("nni-bundle-{}-{id}", std::process::id()));
++            fs::create_dir(&path).unwrap();
++            Self(path.canonicalize().unwrap())
++        }
++
++        fn write(&self, name: &str, bytes: &str) -> PathBuf {
++            let path = self.0.join(name);
++            fs::write(&path, bytes).unwrap();
++            path
++        }
++
++        fn view(&self) -> Arc<ReadView> {
++            Arc::new(ReadView::new(&self.0, &self.0).unwrap())
++        }
++
++        fn record(&self, source: &Path) -> Recorded {
++            let (dependencies, trace) =
++                retrieve_c_dependency_paths_observed("cc", vec![source.to_owned()], self.view())
++                    .unwrap();
++            Recorded {
++                dependencies,
++                trace,
++            }
++        }
++    }
++
++    impl Drop for Fixture {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.0);
++        }
++    }
++
++    fn key(character: char) -> String {
++        character.to_string().repeat(64)
++    }
++
++    #[test]
++    fn shared_records_roundtrip_and_update_without_unrelated_invalidation() {
++        let fixture = Fixture::new();
++        let first = fixture.write("first.c", "#include \"shared.h\"\n");
++        let second = fixture.write("second.c", "#include \"shared.h\"\n");
++        fixture.write("shared.h", "#define VALUE 1\n");
++        let keys = BTreeSet::from([key('a'), key('b')]);
++        let records = BTreeMap::from([
++            (key('a'), fixture.record(&first)),
++            (key('b'), fixture.record(&second)),
++        ]);
++        let saved = Bundle::empty().updated(&records, &keys).unwrap();
++        assert_eq!(saved.counts().files, 3);
++        let saved = Bundle::decode(&saved.encode().unwrap()).unwrap();
++        let view = fixture.view();
++        for (key, record) in &records {
++            assert_eq!(
++                saved.lookup(key, &view).unwrap(),
++                Some(record.dependencies.clone())
++            );
++        }
++        fixture.write("first.c", "#include \"shared.h\"\nint changed;\n");
++        let view = fixture.view();
++        assert!(saved.lookup(&key('a'), &view).unwrap().is_none());
++        assert!(saved.lookup(&key('b'), &view).unwrap().is_some());
++        let updates = BTreeMap::from([(key('a'), fixture.record(&first))]);
++        let updated = saved.updated(&updates, &keys).unwrap();
++        assert_eq!(updated.counts().records, 2);
++        assert_eq!(updated.counts().paths, saved.counts().paths);
++        let view = fixture.view();
++        for key in keys {
++            assert!(updated.lookup(&key, &view).unwrap().is_some());
++        }
++    }
++
++    #[test]
++    fn negative_lookups_and_current_bytes_control_hits() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#include \"optional.h\"\n");
++        let keys = BTreeSet::from([key('a')]);
++        let records = BTreeMap::from([(key('a'), fixture.record(&source))]);
++        let saved = Bundle::empty().updated(&records, &keys).unwrap();
++        fixture.write("irrelevant.h", "#define OTHER 1\n");
++        assert!(saved.lookup(&key('a'), &fixture.view()).unwrap().is_some());
++        fixture.write("optional.h", "#define VALUE 1\n");
++        assert!(saved.lookup(&key('a'), &fixture.view()).unwrap().is_none());
++        let records = BTreeMap::from([(key('a'), fixture.record(&source))]);
++        let saved = saved.updated(&records, &keys).unwrap();
++        fixture.write("optional.h", "#define VALUE 2\n");
++        assert!(saved.lookup(&key('a'), &fixture.view()).unwrap().is_none());
++    }
++
++    #[test]
++    fn resource_byte_changes_preserve_only_the_discovery_value() {
++        let fixture = Fixture::new();
++        let source = fixture.write(
++            "main.c",
++            "unsigned char data[] = {\n#embed \"data.bin\"\n};\n",
++        );
++        let data = fixture.write("data.bin", "A");
++        let records = BTreeMap::from([(key('a'), fixture.record(&source))]);
++        let saved = Bundle::empty()
++            .updated(&records, &BTreeSet::from([key('a')]))
++            .unwrap();
++        fixture.write("data.bin", "B");
++        let dependencies = saved.lookup(&key('a'), &fixture.view()).unwrap().unwrap();
++        assert!(dependencies.contains(&data));
++        assert_eq!(fs::read(data).unwrap(), b"B");
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn persisted_alias_values_keep_build_names_and_reject_equal_byte_retargets() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#include \"alias.h\"\n");
++        fixture.write("first.h", "int value;\n");
++        fixture.write("second.h", "int value;\n");
++        let alias = fixture.0.join("alias.h");
++        std::os::unix::fs::symlink("first.h", &alias).unwrap();
++        let records = BTreeMap::from([(key('a'), fixture.record(&source))]);
++        let saved = Bundle::empty()
++            .updated(&records, &BTreeSet::from([key('a')]))
++            .unwrap();
++        let saved = Bundle::decode(&saved.encode().unwrap()).unwrap();
++        assert!(saved
++            .lookup(&key('a'), &fixture.view())
++            .unwrap()
++            .unwrap()
++            .contains(&alias));
++        fs::remove_file(&alias).unwrap();
++        std::os::unix::fs::symlink("second.h", &alias).unwrap();
++        assert!(saved.lookup(&key('a'), &fixture.view()).unwrap().is_none());
++    }
++
++    #[test]
++    fn malformed_indices_keys_and_versions_are_rejected() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "int value;\n");
++        let records = BTreeMap::from([(key('a'), fixture.record(&source))]);
++        let saved = Bundle::empty()
++            .updated(&records, &BTreeSet::from([key('a')]))
++            .unwrap();
++        let original: serde_json::Value = serde_json::from_str(&saved.encode().unwrap()).unwrap();
++        let mut bad = original.clone();
++        bad["version"] = serde_json::json!(99);
++        assert!(Bundle::decode(&bad.to_string()).is_err());
++        let mut bad = original.clone();
++        bad["records"][key('a')]["dependencies"][0] = serde_json::json!(u32::MAX);
++        assert!(Bundle::decode(&bad.to_string()).is_err());
++        let mut bad = original.clone();
++        bad["records"][key('a')]["key"] = serde_json::json!(key('b'));
++        assert!(Bundle::decode(&bad.to_string()).is_err());
++        let mut bad = original;
++        bad["files"][0][0] = serde_json::json!(u32::MAX);
++        assert!(Bundle::decode(&bad.to_string()).is_err());
++    }
++
++    #[test]
++    fn inconsistent_snapshots_cannot_be_published_together() {
++        let fixture = Fixture::new();
++        let first = fixture.write("first.c", "#include \"shared.h\"\n");
++        let second = fixture.write("second.c", "#include \"shared.h\"\n");
++        fixture.write("shared.h", "#define VALUE 1\n");
++        let old = fixture.record(&first);
++        fixture.write("shared.h", "#define VALUE 2\n");
++        let mixed = BTreeMap::from([(key('a'), old), (key('b'), fixture.record(&second))]);
++        assert!(Bundle::empty()
++            .updated(&mixed, &BTreeSet::from([key('a'), key('b')]))
++            .is_err());
++    }
++}
+diff --git a/crates/nix-ninja/src/discovery_identity.rs b/crates/nix-ninja/src/discovery_identity.rs
+new file mode 100644
+index 0000000..1c668c1
+--- /dev/null
++++ b/crates/nix-ninja/src/discovery_identity.rs
+@@ -0,0 +1,241 @@
++use anyhow::{ensure, Result};
++use serde::Serialize;
++use sha2::{Digest, Sha256};
++use std::collections::BTreeMap;
++use std::fs;
++use std::path::{Path, PathBuf};
++
++#[derive(Clone, Serialize)]
++pub struct Namespace {
++    pub code_sha256: String,
++    pub view_id: String,
++    pub root: PathBuf,
++    pub cwd: PathBuf,
++    pub system: String,
++    pub store_dir: PathBuf,
++    pub tools: BTreeMap<String, String>,
++    pub wrapper_vars: BTreeMap<String, String>,
++    pub search_path: String,
++}
++
++pub struct Identity {
++    pub namespace: String,
++}
++
++fn hex(value: &str, length: usize) -> bool {
++    value.len() == length
++        && value
++            .bytes()
++            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++}
++
++fn fingerprint(value: &impl Serialize) -> Result<String> {
++    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
++}
++
++pub fn code_digest(path: &Path) -> Result<String> {
++    ensure!(
++        fs::metadata(path)?.is_file(),
++        "scanner binary must be a regular file"
++    );
++    Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
++}
++
++impl Identity {
++    pub fn new(namespace: &Namespace) -> Result<Self> {
++        ensure!(
++            hex(&namespace.code_sha256, 64) && hex(&namespace.view_id, 32),
++            "invalid discovery namespace identity"
++        );
++        ensure!(
++            namespace.root.is_absolute() && namespace.cwd.starts_with(&namespace.root),
++            "working directory escapes input namespace"
++        );
++        ensure!(
++            namespace.store_dir.is_absolute()
++                && !namespace.system.is_empty()
++                && !namespace.search_path.is_empty(),
++            "incomplete discovery environment"
++        );
++        for name in [
++            "cc",
++            "coreutils",
++            "nix",
++            "nix-ninja",
++            "nix-ninja-task",
++            "patchelf",
++        ] {
++            ensure!(
++                namespace.tools.contains_key(name),
++                "missing tool identity: {name}"
++            );
++        }
++        Ok(Self {
++            namespace: fingerprint(&(1_u32, namespace))?,
++        })
++    }
++
++    pub fn action(&self, command: &str, seeds: &[PathBuf], compiler: &Path) -> Result<String> {
++        ensure!(
++            !command.is_empty() && !seeds.is_empty() && compiler.is_absolute(),
++            "incomplete compilation action"
++        );
++        fingerprint(&(1_u32, &self.namespace, command, seeds, compiler))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::atomic::{AtomicU64, Ordering};
++
++    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
++
++    fn namespace() -> Namespace {
++        Namespace {
++            code_sha256: "a".repeat(64),
++            view_id: "b".repeat(32),
++            root: "/tmp/inputs".into(),
++            cwd: "/tmp/inputs/build".into(),
++            system: "x86_64-linux".into(),
++            store_dir: "/nix/store".into(),
++            tools: [
++                "cc",
++                "coreutils",
++                "nix",
++                "nix-ninja",
++                "nix-ninja-task",
++                "patchelf",
++            ]
++            .into_iter()
++            .map(|name| (name.to_owned(), format!("/nix/store/tool-{name}")))
++            .collect(),
++            wrapper_vars: BTreeMap::from([("NIX_HARDENING_ENABLE".into(), "fortify".into())]),
++            search_path: "/nix/store/cc/bin:/nix/store/coreutils/bin".into(),
++        }
++    }
++
++    fn action(namespace: &Namespace) -> String {
++        Identity::new(namespace)
++            .unwrap()
++            .action(
++                "cc -Iearly -Ilate -c main.c",
++                &["main.c".into(), "config.h".into()],
++                Path::new("/nix/store/cc/bin/cc"),
++            )
++            .unwrap()
++    }
++
++    #[test]
++    fn changed_environment_tool_code_or_view_cannot_share_records() {
++        let baseline = namespace();
++        let expected = action(&baseline);
++        let mut changes = Vec::new();
++        let mut changed = baseline.clone();
++        changed.code_sha256 = "c".repeat(64);
++        changes.push(changed);
++        let mut changed = baseline.clone();
++        changed.view_id = "d".repeat(32);
++        changes.push(changed);
++        let mut changed = baseline.clone();
++        changed.root = "/other/inputs".into();
++        changed.cwd = "/other/inputs/build".into();
++        changes.push(changed);
++        let mut changed = baseline.clone();
++        changed.cwd = "/tmp/inputs/nested".into();
++        changes.push(changed);
++        let mut changed = baseline.clone();
++        changed.system = "aarch64-linux".into();
++        changes.push(changed);
++        let mut changed = baseline.clone();
++        changed.store_dir = "/other/store".into();
++        changes.push(changed);
++        let mut changed = baseline.clone();
++        changed
++            .tools
++            .insert("cc".into(), "/nix/store/other-cc".into());
++        changes.push(changed);
++        let mut changed = baseline.clone();
++        changed
++            .wrapper_vars
++            .insert("NIX_CFLAGS_COMPILE".into(), "-include config.h".into());
++        changes.push(changed);
++        let mut changed = baseline.clone();
++        changed.search_path = "/nix/store/other/bin".into();
++        changes.push(changed);
++        for changed in changes {
++            assert_ne!(action(&changed), expected);
++        }
++        assert_eq!(action(&namespace()), expected);
++    }
++
++    #[test]
++    fn command_order_seed_boundaries_and_compiler_resolution_are_distinct() {
++        let identity = Identity::new(&namespace()).unwrap();
++        let compiler = Path::new("/nix/store/cc/bin/cc");
++        let seeds = vec!["main.c".into(), "config.h".into()];
++        let expected = identity.action("cc -Ia -Ib", &seeds, compiler).unwrap();
++        assert_ne!(
++            identity.action("cc -Ib -Ia", &seeds, compiler).unwrap(),
++            expected
++        );
++        assert_ne!(
++            identity
++                .action(
++                    "cc -Ia -Ib",
++                    &["config.h".into(), "main.c".into()],
++                    compiler
++                )
++                .unwrap(),
++            expected
++        );
++        assert_ne!(
++            identity
++                .action("cc -Ia -Ib", &["main.cconfig.h".into()], compiler)
++                .unwrap(),
++            expected
++        );
++        assert_ne!(
++            identity
++                .action("cc -Ia -Ib", &seeds, Path::new("/nix/store/other/bin/cc"))
++                .unwrap(),
++            expected
++        );
++        assert_ne!(
++            identity
++                .action("cc", &["a".into(), "bc".into()], compiler)
++                .unwrap(),
++            identity
++                .action("cc", &["ab".into(), "c".into()], compiler)
++                .unwrap()
++        );
++    }
++
++    #[test]
++    fn actual_binary_bytes_control_code_identity() {
++        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
++        let path = std::env::temp_dir().join(format!("nni-code-{}-{id}", std::process::id()));
++        fs::write(&path, b"first binary").unwrap();
++        let first = code_digest(&path).unwrap();
++        fs::write(&path, b"other binary").unwrap();
++        assert_ne!(code_digest(&path).unwrap(), first);
++        fs::remove_file(path).unwrap();
++    }
++
++    #[test]
++    fn partial_or_outside_namespace_is_rejected() {
++        let mut value = namespace();
++        value.code_sha256 = "unknown".into();
++        assert!(Identity::new(&value).is_err());
++        let mut value = namespace();
++        value.cwd = "/tmp/elsewhere".into();
++        assert!(Identity::new(&value).is_err());
++        let mut value = namespace();
++        value.tools.remove("cc");
++        assert!(Identity::new(&value).is_err());
++        assert!(Identity::new(&namespace())
++            .unwrap()
++            .action("cc", &[], Path::new("cc"))
++            .is_err());
++    }
++}
+diff --git a/crates/nix-ninja/src/discovery_policy.rs b/crates/nix-ninja/src/discovery_policy.rs
+new file mode 100644
+index 0000000..1b6513f
+--- /dev/null
++++ b/crates/nix-ninja/src/discovery_policy.rs
+@@ -0,0 +1,455 @@
++use deps_infer::observations::{DiscoveryTrace, ReadView};
++use n2::canon;
++use regex::Regex;
++use std::collections::{BTreeMap, HashMap, HashSet};
++use std::path::{Path, PathBuf};
++use std::sync::LazyLock;
++
++type Check<T> = Result<T, &'static str>;
++
++pub struct CommandInputs<'a> {
++    pub command: &'a str,
++    pub seeds: &'a [PathBuf],
++    pub cwd: &'a Path,
++    pub compiler: &'a Path,
++    pub store_inputs: &'a [PathBuf],
++    pub wrapper_vars: &'a BTreeMap<String, String>,
++    pub ambient_search: bool,
++}
++
++pub struct Policy {
++    pub trace: DiscoveryTrace,
++}
++
++fn normalized(path: &Path) -> Check<PathBuf> {
++    let mut value = path.to_str().ok_or("non-utf8-path")?.to_owned();
++    canon::canonicalize_path(&mut value);
++    Ok(value.into())
++}
++
++fn guarded(path: &Path, roots: &[PathBuf]) -> bool {
++    path.starts_with("/nix/store")
++        && roots
++            .iter()
++            .any(|root| root.parent() == Some(Path::new("/nix/store")) && path.starts_with(root))
++}
++
++fn observe(
++    path: &Path,
++    action: &CommandInputs<'_>,
++    view: &ReadView,
++    trace: &mut DiscoveryTrace,
++) -> Check<Option<PathBuf>> {
++    let path = action.cwd.join(path);
++    let found = view.resolve(&path).map_err(|_| "unobservable-search")?;
++    trace.resolutions.insert(path, found.clone());
++    Ok(found)
++}
++
++fn flags(
++    args: &[String],
++    wrapper: bool,
++    action: &CommandInputs<'_>,
++    view: &ReadView,
++    trace: &mut DiscoveryTrace,
++    includes: &mut Vec<PathBuf>,
++    forced: &mut Vec<PathBuf>,
++) -> Check<()> {
++    let mut index = 0;
++    while index < args.len() {
++        let arg = &args[index];
++        if arg.starts_with("--embed-dir") && !arg.starts_with("--embed-dir=") {
++            return Err("unsupported-include-mode");
++        }
++        if arg.starts_with('@') {
++            return Err("response-file");
++        }
++        if arg.starts_with("-fmodule")
++            || arg.starts_with("-finput-charset")
++            || arg.starts_with("-fpreprocessed")
++            || arg.starts_with("-Wp,")
++            || matches!(
++                arg.as_str(),
++                "-Xpreprocessor" | "-Xclang" | "-nostdinc" | "-nostdinc++"
++            )
++            || arg.starts_with("--sysroot")
++            || arg.starts_with("-isysroot")
++            || arg.starts_with("-B")
++        {
++            return Err("unsupported-preprocessor-mode");
++        }
++        let (kind, value) = if matches!(arg.as_str(), "-I" | "-include" | "-isystem" | "-x") {
++            index += 1;
++            (
++                arg.as_str(),
++                Some(args.get(index).ok_or("missing-flag-value")?.as_str()),
++            )
++        } else if let Some(value) = arg.strip_prefix("-isystem") {
++            ("-isystem", Some(value))
++        } else if let Some(value) = arg.strip_prefix("-include") {
++            ("-include", Some(value))
++        } else if let Some(value) = arg.strip_prefix("-I") {
++            ("-I", Some(value))
++        } else if arg.starts_with("-i") {
++            return Err("unsupported-include-mode");
++        } else {
++            ("", None)
++        };
++        if let Some(value) = value {
++            match kind {
++                "-I" => {
++                    if wrapper || value.starts_with('=') || value == "-" {
++                        return Err("unsupported-include-mode");
++                    }
++                    includes.push(PathBuf::from(value));
++                }
++                "-include" => {
++                    if value.starts_with("-pch") {
++                        return Err("unsupported-preprocessor-mode");
++                    }
++                    forced.push(PathBuf::from(value));
++                }
++                "-isystem" => {
++                    let resolved = observe(Path::new(value), action, view, trace)?
++                        .ok_or("missing-system-root")?;
++                    if !guarded(&resolved, action.store_inputs) || !resolved.is_dir() {
++                        return Err("unguarded-system-root");
++                    }
++                }
++                "-x" if !matches!(value, "c" | "c++" | "none") => {
++                    return Err("unsupported-language")
++                }
++                _ => {}
++            }
++        }
++        if wrapper && arg.starts_with("--embed-dir") {
++            return Err("unmodeled-wrapper-search");
++        }
++        index += 1;
++    }
++    Ok(())
++}
++
++pub fn command(action: &CommandInputs<'_>, view: &ReadView) -> Check<Policy> {
++    if action.ambient_search {
++        return Err("ambient-compiler-search");
++    }
++    if action.command.contains(['$', '`', ';', '&', '|', '<', '>']) {
++        return Err("compound-command");
++    }
++    let args = shell_words::split(action.command).map_err(|_| "command-syntax")?;
++    let program = args
++        .first()
++        .and_then(|arg| Path::new(arg).file_name())
++        .and_then(|name| name.to_str())
++        .ok_or("missing-compiler")?;
++    if !matches!(program, "cc" | "c++" | "gcc" | "g++")
++        || !guarded(action.compiler, action.store_inputs)
++    {
++        return Err("unguarded-compiler");
++    }
++    let mut trace = DiscoveryTrace::default();
++    let mut includes = vec![PathBuf::from(".")];
++    let mut forced = Vec::new();
++    flags(
++        &args[1..],
++        false,
++        action,
++        view,
++        &mut trace,
++        &mut includes,
++        &mut forced,
++    )?;
++    for (key, value) in action.wrapper_vars {
++        if key.starts_with("NIX_CFLAGS_COMPILE") {
++            let args = shell_words::split(value).map_err(|_| "wrapper-syntax")?;
++            flags(
++                &args,
++                true,
++                action,
++                view,
++                &mut trace,
++                &mut includes,
++                &mut forced,
++            )?;
++        }
++    }
++    if !forced.is_empty() {
++        let seeds = action
++            .seeds
++            .iter()
++            .map(|path| normalized(&action.cwd.join(path)))
++            .collect::<Check<HashSet<_>>>()?;
++        for file in forced {
++            let mut found = false;
++            for directory in &includes {
++                let candidate = directory.join(&file);
++                if let Some(target) = observe(&candidate, action, view, &mut trace)? {
++                    if !target.is_file() {
++                        return Err("forced-header-not-regular");
++                    }
++                    let logical = normalized(&action.cwd.join(&candidate))?;
++                    if !seeds.contains(&logical) {
++                        return Err("forced-header-not-seeded");
++                    }
++                    if observe(&logical, action, view, &mut trace)?.as_ref() != Some(&target) {
++                        return Err("forced-header-alias-traversal");
++                    }
++                    found = true;
++                    break;
++                }
++            }
++            if !found {
++                return Err("forced-header-not-seeded");
++            }
++        }
++    }
++    Ok(Policy { trace })
++}
++
++static DIRECTIVE: LazyLock<Regex> =
++    LazyLock::new(|| Regex::new(r"^\s*#\s*([a-zA-Z_][a-zA-Z_0-9]*)").unwrap());
++static LITERAL: LazyLock<Regex> =
++    LazyLock::new(|| Regex::new(r##"^\s*#\s*(include|embed)\s*("[^"\n]+"|<[^>\n]+>)"##).unwrap());
++static QUERY: LazyLock<Regex> = LazyLock::new(|| {
++    Regex::new(r##"__has_(include|embed)\s*\(\s*("[^"\n]+"|<[^>\n]+>)\s*\)"##).unwrap()
++});
++static QUERY_START: LazyLock<Regex> =
++    LazyLock::new(|| Regex::new(r"__has_(include|embed)\s*\(").unwrap());
++
++fn source(bytes: &[u8]) -> Check<()> {
++    let text = std::str::from_utf8(bytes).map_err(|_| "non-utf8-source")?;
++    if text.contains("??") {
++        return Err("unmodeled-source-transform");
++    }
++    if text.contains("__has_include_next") {
++        return Err("include-next");
++    }
++    let mut literals = HashSet::new();
++    for line in text.lines() {
++        let directive = DIRECTIVE.captures(line);
++        if let Some(directive) = directive {
++            match directive.get(1).unwrap().as_str() {
++                "include" | "embed" => {
++                    let literal = LITERAL.captures(line).ok_or("computed-dependency")?;
++                    let name = &literal[2];
++                    if name[1..name.len() - 1].contains(['"', '>']) {
++                        return Err("unmodeled-header-name");
++                    }
++                    literals.insert((literal[1].to_owned(), literal[2].to_owned()));
++                }
++                "include_next" | "import" => return Err("unsupported-directive"),
++                word if line.trim_end().ends_with('\\')
++                    && (word.starts_with("inc")
++                        || word.starts_with("emb")
++                        || word.starts_with("imp")) =>
++                {
++                    return Err("continued-directive")
++                }
++                "pragma" if line.contains("pch") => return Err("unsupported-preprocessor-mode"),
++                _ => {}
++            }
++        } else if line.contains('#')
++            && ["include", "embed", "import"]
++                .iter()
++                .any(|word| line.contains(word))
++        {
++            return Err("unmodeled-directive-spelling");
++        }
++    }
++    let queries: Vec<_> = QUERY.captures_iter(text).collect();
++    if queries.len() != QUERY_START.find_iter(text).count() {
++        return Err("computed-query");
++    }
++    for query in queries {
++        if !literals.contains(&(query[1].to_owned(), query[2].to_owned())) {
++            return Err("unobserved-existence-query");
++        }
++    }
++    Ok(())
++}
++
++#[derive(Default)]
++pub struct FilePolicy {
++    checked: HashMap<PathBuf, Check<()>>,
++}
++
++impl FilePolicy {
++    pub fn trace(&mut self, view: &ReadView, trace: &DiscoveryTrace) -> Check<()> {
++        for path in trace.files.keys() {
++            let checked = self.checked.entry(path.clone()).or_insert_with(|| {
++                let bytes = view.bytes(path).map_err(|_| "unobservable-source")?;
++                source(&bytes)
++            });
++            (*checked)?;
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use deps_infer::c_include_parser::retrieve_c_dependency_paths_observed;
++    use std::fs;
++    use std::sync::atomic::{AtomicU64, Ordering};
++    use std::sync::Arc;
++
++    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
++
++    struct Fixture(PathBuf);
++    impl Fixture {
++        fn new() -> Self {
++            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
++            let root = std::env::temp_dir().join(format!("nni-policy-{}-{id}", std::process::id()));
++            fs::create_dir(&root).unwrap();
++            Self(root.canonicalize().unwrap())
++        }
++        fn write(&self, name: &str, bytes: &str) -> PathBuf {
++            let path = self.0.join(name);
++            fs::create_dir_all(path.parent().unwrap()).unwrap();
++            fs::write(&path, bytes).unwrap();
++            path
++        }
++        fn check(&self, text: &str, seeds: &[PathBuf]) -> Check<Policy> {
++            let roots = vec![PathBuf::from(
++                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-cc",
++            )];
++            command(
++                &CommandInputs {
++                    command: text,
++                    seeds,
++                    cwd: &self.0,
++                    compiler: &roots[0].join("bin/cc"),
++                    store_inputs: &roots,
++                    wrapper_vars: &BTreeMap::new(),
++                    ambient_search: false,
++                },
++                &ReadView::new(&self.0, &self.0).unwrap(),
++            )
++        }
++    }
++    impl Drop for Fixture {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.0);
++        }
++    }
++
++    #[test]
++    fn known_unmodeled_commands_bypass_before_observation() {
++        let fixture = Fixture::new();
++        let seeds = vec![fixture.write("main.c", "int value;\n")];
++        for text in [
++            "cc @args",
++            "cc -I=include",
++            "cc -iquote include",
++            "cc -include-pch saved.pch",
++            "cc -Wp,-Iinclude",
++            "cc -Xpreprocessor -Iinclude",
++            "cc --sysroot=/sdk",
++            "cc -fmodules-ts",
++            "cc -x assembler",
++            "cc main.c && touch done",
++            "cc -I$CPATH",
++            "cc -I",
++        ] {
++            assert!(fixture.check(text, &seeds).is_err(), "{text}");
++        }
++        assert!(fixture.check("cc -I. -std=c23 -c main.c", &seeds).is_ok());
++    }
++
++    #[test]
++    fn forced_headers_require_the_seeded_build_path_and_negative_searches() {
++        let fixture = Fixture::new();
++        let main = fixture.write("main.c", "int value;\n");
++        fs::create_dir(fixture.0.join("early")).unwrap();
++        let header = fixture.write("late/config.h", "#define VALUE 1\n");
++        let seeds = vec![main, header];
++        let saved = fixture
++            .check("cc -Iearly -Ilate -include config.h", &seeds)
++            .unwrap();
++        assert_eq!(
++            saved.trace.resolutions[&fixture.0.join("early/config.h")],
++            None
++        );
++        fixture.write("early/config.h", "#define VALUE 2\n");
++        assert!(!ReadView::new(&fixture.0, &fixture.0)
++            .unwrap()
++            .validate(&saved.trace)
++            .unwrap());
++        assert_eq!(
++            fixture
++                .check("cc -Iearly -Ilate -include config.h", &seeds)
++                .err(),
++            Some("forced-header-not-seeded")
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn equal_physical_forced_header_is_insufficient_with_another_logical_parent() {
++        let fixture = Fixture::new();
++        let header = fixture.write("real/config.h", "#include \"near.h\"\n");
++        fs::create_dir(fixture.0.join("alias")).unwrap();
++        std::os::unix::fs::symlink("../real/config.h", fixture.0.join("alias/config.h")).unwrap();
++        assert_eq!(
++            fixture
++                .check("cc -Ialias -include config.h", &[header])
++                .err(),
++            Some("forced-header-not-seeded")
++        );
++    }
++
++    #[test]
++    fn file_checks_cover_queries_computed_forms_and_raw_data_boundaries() {
++        for text in [
++            "#include PICK_HEADER\n",
++            "#include_next <value.h>\n",
++            "#import \"value.h\"\n",
++            "#embed RESOURCE\n",
++            "#include /* comment */ \"value.h\"\n",
++            "/* comment */ #include \"value.h\"\n",
++            "#if __has_include(\"probe.h\")\n#define VALUE 1\n#endif\n",
++            "#if __has_include(PICK_HEADER)\n#endif\n",
++            "#inc\\\nlude \"value.h\"\n",
++        ] {
++            assert!(source(text.as_bytes()).is_err(), "{text}");
++        }
++        assert!(source(b"#if __has_include(\"value.h\")\n#include \"value.h\"\n#endif\n").is_ok());
++        assert!(source(b"#if __has_embed(\"data.bin\")\n#embed \"data.bin\"\n#endif\n").is_ok());
++        assert!(source(&[0xff, b'\n']).is_err());
++        let fixture = Fixture::new();
++        let main = fixture.write(
++            "main.c",
++            "unsigned char data[] = {\n#embed \"data.bin\"\n};\n",
++        );
++        fixture.write("data.bin", "#include COMPUTED\n");
++        let view = Arc::new(ReadView::new(&fixture.0, &fixture.0).unwrap());
++        let (_, trace) =
++            retrieve_c_dependency_paths_observed("cc", vec![main], view.clone()).unwrap();
++        assert!(FilePolicy::default().trace(&view, &trace).is_ok());
++    }
++
++    #[test]
++    fn mutable_system_paths_and_ambient_search_are_rejected() {
++        let fixture = Fixture::new();
++        fixture.write("include/value.h", "int value;\n");
++        assert_eq!(
++            fixture.check("cc -isystem include", &[]).err(),
++            Some("unguarded-system-root")
++        );
++        let action = CommandInputs {
++            command: "cc",
++            seeds: &[],
++            cwd: &fixture.0,
++            compiler: Path::new("/nix/store/cc/bin/cc"),
++            store_inputs: &[],
++            wrapper_vars: &BTreeMap::new(),
++            ambient_search: true,
++        };
++        assert_eq!(
++            command(&action, &ReadView::new(&fixture.0, &fixture.0).unwrap()).err(),
++            Some("ambient-compiler-search")
++        );
++    }
++}
+diff --git a/crates/nix-ninja/src/discovery_state.rs b/crates/nix-ninja/src/discovery_state.rs
+new file mode 100644
+index 0000000..c3af7c3
+--- /dev/null
++++ b/crates/nix-ninja/src/discovery_state.rs
+@@ -0,0 +1,431 @@
++use anyhow::{ensure, Result};
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
++use std::fs::{self, File, OpenOptions};
++use std::io::{Read, Seek, SeekFrom, Write};
++use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicU64, Ordering};
++
++const MAX_BYTES: u64 = 64 * 1024 * 1024;
++const OWNER: &str = ".nix-ninja-discovery-owner";
++const MAGIC: &[u8] = b"nix-ninja local dependency state\n";
++const TEMP_PREFIX: &str = ".nni-discovery.tmp-";
++static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
++
++#[derive(Serialize, Deserialize)]
++struct Envelope {
++    version: u32,
++    namespace: String,
++    payload: String,
++    checksum: String,
++}
++
++#[derive(Debug, PartialEq)]
++pub enum Loaded {
++    Hit(String),
++    Miss(&'static str),
++}
++
++#[derive(Clone, Copy, PartialEq)]
++enum Publication {
++    Written,
++    Renamed,
++}
++
++pub struct Directory {
++    root: PathBuf,
++    _owner: File,
++}
++
++impl Directory {
++    pub fn open(requested: &Path, protected: &Path) -> Result<Self> {
++        let protected = protected.canonicalize()?;
++        let uid = fs::metadata(&protected)?.uid();
++        let root = if requested.exists() {
++            ensure!(
++                !fs::symlink_metadata(requested)?.is_symlink(),
++                "cache root must not be a symlink"
++            );
++            requested.canonicalize()?
++        } else {
++            let parent = requested
++                .parent()
++                .ok_or_else(|| anyhow::anyhow!("cache root needs a parent"))?
++                .canonicalize()?;
++            parent.join(
++                requested
++                    .file_name()
++                    .ok_or_else(|| anyhow::anyhow!("cache root needs a name"))?,
++            )
++        };
++        ensure!(
++            !root.starts_with(&protected),
++            "cache must be outside build inputs"
++        );
++        match fs::DirBuilder::new().mode(0o700).create(&root) {
++            Ok(()) => {}
++            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
++            Err(error) => return Err(error.into()),
++        }
++        let metadata = fs::symlink_metadata(&root)?;
++        ensure!(
++            metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o777 == 0o700,
++            "cache root must be private and have the input-view owner"
++        );
++        let marker = root.join(OWNER);
++        let mut owner = match fs::symlink_metadata(&marker) {
++            Ok(metadata) => {
++                ensure!(
++                    metadata.is_file() && metadata.uid() == uid && metadata.mode() & 0o777 == 0o600,
++                    "invalid cache owner file"
++                );
++                OpenOptions::new().read(true).write(true).open(&marker)?
++            }
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++                ensure!(
++                    root.read_dir()?.next().is_none(),
++                    "unowned cache directory is not empty"
++                );
++                OpenOptions::new()
++                    .read(true)
++                    .write(true)
++                    .create_new(true)
++                    .mode(0o600)
++                    .open(&marker)?
++            }
++            Err(error) => return Err(error.into()),
++        };
++        owner.try_lock()?;
++        ensure!(
++            owner.metadata()?.len() <= MAGIC.len() as u64,
++            "invalid cache owner marker"
++        );
++        let mut found = Vec::new();
++        owner.read_to_end(&mut found)?;
++        if found != MAGIC {
++            let only_marker = root
++                .read_dir()?
++                .all(|entry| entry.is_ok_and(|entry| entry.file_name() == OWNER));
++            ensure!(
++                only_marker && MAGIC.starts_with(&found),
++                "cache owner marker mismatch"
++            );
++            owner.seek(SeekFrom::Start(0))?;
++            owner.set_len(0)?;
++            owner.write_all(MAGIC)?;
++        }
++        let directory = Self {
++            root,
++            _owner: owner,
++        };
++        directory.cleanup_temps()?;
++        Ok(directory)
++    }
++
++    fn cleanup_temps(&self) -> Result<()> {
++        for entry in self.root.read_dir()? {
++            let entry = entry?;
++            let name = entry.file_name();
++            let Some(suffix) = name
++                .to_str()
++                .and_then(|name| name.strip_prefix(TEMP_PREFIX))
++            else {
++                continue;
++            };
++            let parts: Vec<_> = suffix.split('-').collect();
++            let owned = parts.len() == 2
++                && parts
++                    .iter()
++                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
++            if owned && entry.file_type()?.is_file() {
++                fs::remove_file(entry.path())?;
++            }
++        }
++        Ok(())
++    }
++
++    pub fn load(&self, namespace: &str) -> Result<Loaded> {
++        let path = self.root.join("state.json");
++        let metadata = match fs::symlink_metadata(&path) {
++            Ok(metadata) => metadata,
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++                return Ok(Loaded::Miss("absent"))
++            }
++            Err(error) => return Err(error.into()),
++        };
++        if !metadata.is_file() {
++            return Ok(Loaded::Miss("non-regular"));
++        }
++        if metadata.len() > MAX_BYTES {
++            return Ok(Loaded::Miss("oversized"));
++        }
++        let bytes = fs::read(path)?;
++        let envelope: Envelope = match serde_json::from_slice(&bytes) {
++            Ok(envelope) => envelope,
++            Err(_) => return Ok(Loaded::Miss("malformed")),
++        };
++        if envelope.version != 1 {
++            return Ok(Loaded::Miss("version"));
++        }
++        if envelope.namespace != namespace {
++            return Ok(Loaded::Miss("namespace"));
++        }
++        if envelope.checksum != format!("{:x}", Sha256::digest(envelope.payload.as_bytes())) {
++            return Ok(Loaded::Miss("checksum"));
++        }
++        Ok(Loaded::Hit(envelope.payload))
++    }
++
++    pub fn publish(&mut self, namespace: &str, payload: &str) -> Result<()> {
++        self.publish_with(namespace, payload, |_| {})
++    }
++
++    fn publish_with(
++        &mut self,
++        namespace: &str,
++        payload: &str,
++        mut hook: impl FnMut(Publication),
++    ) -> Result<()> {
++        ensure!(
++            payload.len() as u64 <= MAX_BYTES,
++            "cache payload exceeds its budget"
++        );
++        let envelope = Envelope {
++            version: 1,
++            namespace: namespace.to_owned(),
++            payload: payload.to_owned(),
++            checksum: format!("{:x}", Sha256::digest(payload.as_bytes())),
++        };
++        let bytes = serde_json::to_vec(&envelope)?;
++        ensure!(
++            bytes.len() as u64 <= MAX_BYTES,
++            "cache envelope exceeds its budget"
++        );
++        self.cleanup_temps()?;
++        let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
++        let temporary = self
++            .root
++            .join(format!("{TEMP_PREFIX}{}-{id}", std::process::id()));
++        let mut file = OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .mode(0o600)
++            .open(&temporary)?;
++        file.write_all(&bytes)?;
++        drop(file);
++        hook(Publication::Written);
++        fs::rename(temporary, self.root.join("state.json"))?;
++        hook(Publication::Renamed);
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::os::unix::fs::{symlink, PermissionsExt};
++    use std::process::Command;
++
++    struct Fixture {
++        root: PathBuf,
++        protected: PathBuf,
++        cache: PathBuf,
++    }
++
++    impl Fixture {
++        fn new() -> Self {
++            let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
++            let root =
++                std::env::temp_dir().join(format!("nni-state-test-{}-{id}", std::process::id()));
++            fs::create_dir(&root).unwrap();
++            let protected = root.join("inputs");
++            fs::create_dir(&protected).unwrap();
++            let cache = root.join("cache");
++            Self {
++                root,
++                protected,
++                cache,
++            }
++        }
++
++        fn open(&self) -> Directory {
++            Directory::open(&self.cache, &self.protected).unwrap()
++        }
++
++        fn child(&self, mode: &str) -> std::process::ExitStatus {
++            Command::new(std::env::current_exe().unwrap())
++                .args([
++                    "--exact",
++                    "discovery_state::tests::child_process",
++                    "--ignored",
++                ])
++                .env("NNI_STATE_CHILD_MODE", mode)
++                .env("NNI_STATE_CHILD_ROOT", &self.root)
++                .output()
++                .unwrap()
++                .status
++        }
++    }
++
++    impl Drop for Fixture {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.root);
++        }
++    }
++
++    #[test]
++    fn roundtrip_and_namespace_miss() {
++        let fixture = Fixture::new();
++        let mut directory = fixture.open();
++        assert_eq!(directory.load("a").unwrap(), Loaded::Miss("absent"));
++        directory.publish("a", r#"{"answer":42}"#).unwrap();
++        assert_eq!(
++            directory.load("a").unwrap(),
++            Loaded::Hit(r#"{"answer":42}"#.to_owned())
++        );
++        assert_eq!(directory.load("b").unwrap(), Loaded::Miss("namespace"));
++    }
++
++    #[test]
++    fn malformed_old_and_corrupt_records_are_disposable() {
++        let fixture = Fixture::new();
++        let mut directory = fixture.open();
++        let state = fixture.cache.join("state.json");
++        fs::write(&state, b"{\"version\":").unwrap();
++        assert_eq!(directory.load("a").unwrap(), Loaded::Miss("malformed"));
++        directory.publish("a", "payload").unwrap();
++        let mut envelope: Envelope = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
++        envelope.version = 0;
++        fs::write(&state, serde_json::to_vec(&envelope).unwrap()).unwrap();
++        assert_eq!(directory.load("a").unwrap(), Loaded::Miss("version"));
++        envelope.version = 1;
++        envelope.payload.push('x');
++        fs::write(&state, serde_json::to_vec(&envelope).unwrap()).unwrap();
++        assert_eq!(directory.load("a").unwrap(), Loaded::Miss("checksum"));
++        directory.publish("a", "recovered").unwrap();
++        assert_eq!(
++            directory.load("a").unwrap(),
++            Loaded::Hit("recovered".to_owned())
++        );
++    }
++
++    #[test]
++    fn unowned_or_input_directories_are_not_modified() {
++        let fixture = Fixture::new();
++        fs::create_dir(&fixture.cache).unwrap();
++        fs::set_permissions(&fixture.cache, fs::Permissions::from_mode(0o700)).unwrap();
++        fs::write(fixture.cache.join("notes.txt"), "keep this").unwrap();
++        assert!(Directory::open(&fixture.cache, &fixture.protected).is_err());
++        assert!(!fixture.cache.join(OWNER).exists());
++        assert_eq!(
++            fs::read_to_string(fixture.cache.join("notes.txt")).unwrap(),
++            "keep this"
++        );
++        let inside = fixture.protected.join("cache");
++        assert!(Directory::open(&inside, &fixture.protected).is_err());
++        assert!(!inside.exists());
++    }
++
++    #[test]
++    fn cache_lock_excludes_another_process_until_release() {
++        let fixture = Fixture::new();
++        let directory = fixture.open();
++        assert_eq!(fixture.child("open").code(), Some(43));
++        drop(directory);
++        assert!(fixture.child("open").success());
++    }
++
++    #[test]
++    fn process_exit_at_publication_boundaries_recovers() {
++        for (mode, expected) in [("before", "old"), ("after", "new")] {
++            let fixture = Fixture::new();
++            {
++                let mut directory = fixture.open();
++                directory.publish("a", "old").unwrap();
++            }
++            assert_eq!(fixture.child(mode).code(), Some(86));
++            let directory = fixture.open();
++            assert_eq!(
++                directory.load("a").unwrap(),
++                Loaded::Hit(expected.to_owned())
++            );
++            assert!(!fixture.cache.read_dir().unwrap().any(|entry| entry
++                .unwrap()
++                .file_name()
++                .to_string_lossy()
++                .starts_with(TEMP_PREFIX)));
++        }
++    }
++
++    #[test]
++    fn oversized_and_symlinked_state_are_not_trusted() {
++        let fixture = Fixture::new();
++        let mut directory = fixture.open();
++        let state = fixture.cache.join("state.json");
++        File::create(&state)
++            .unwrap()
++            .set_len(MAX_BYTES + 1)
++            .unwrap();
++        assert_eq!(directory.load("a").unwrap(), Loaded::Miss("oversized"));
++        fs::remove_file(&state).unwrap();
++        let source = fixture.protected.join("source.txt");
++        fs::write(&source, "source").unwrap();
++        symlink(&source, &state).unwrap();
++        assert_eq!(directory.load("a").unwrap(), Loaded::Miss("non-regular"));
++        directory.publish("a", "new").unwrap();
++        assert_eq!(fs::read_to_string(source).unwrap(), "source");
++        assert_eq!(directory.load("a").unwrap(), Loaded::Hit("new".to_owned()));
++    }
++
++    #[test]
++    fn interrupted_marker_initialization_and_temps_recover() {
++        let fixture = Fixture::new();
++        fs::create_dir(&fixture.cache).unwrap();
++        fs::set_permissions(&fixture.cache, fs::Permissions::from_mode(0o700)).unwrap();
++        OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .mode(0o600)
++            .open(fixture.cache.join(OWNER))
++            .unwrap();
++        {
++            let _directory = fixture.open();
++        }
++        fs::write(fixture.cache.join(format!("{TEMP_PREFIX}1-2")), "partial").unwrap();
++        fs::write(fixture.cache.join("notes.txt"), "keep").unwrap();
++        {
++            let _directory = fixture.open();
++        }
++        assert!(!fixture.cache.join(format!("{TEMP_PREFIX}1-2")).exists());
++        assert_eq!(
++            fs::read_to_string(fixture.cache.join("notes.txt")).unwrap(),
++            "keep"
++        );
++    }
++
++    #[test]
++    #[ignore]
++    fn child_process() {
++        let Ok(mode) = std::env::var("NNI_STATE_CHILD_MODE") else {
++            return;
++        };
++        let root = PathBuf::from(std::env::var_os("NNI_STATE_CHILD_ROOT").unwrap());
++        let result = Directory::open(&root.join("cache"), &root.join("inputs"));
++        let Ok(mut directory) = result else {
++            std::process::exit(43);
++        };
++        if mode == "open" {
++            return;
++        }
++        directory
++            .publish_with("a", "new", |point| {
++                if (mode == "before" && point == Publication::Written)
++                    || (mode == "after" && point == Publication::Renamed)
++                {
++                    std::process::exit(86);
++                }
++            })
++            .unwrap();
++    }
++}
+diff --git a/crates/nix-ninja/src/input_view.rs b/crates/nix-ninja/src/input_view.rs
+new file mode 100644
+index 0000000..d83ec58
+--- /dev/null
++++ b/crates/nix-ninja/src/input_view.rs
+@@ -0,0 +1,265 @@
++use anyhow::{ensure, Context, Result};
++use deps_infer::observations::ReadView;
++use serde::Deserialize;
++use std::fs::{self, File, OpenOptions};
++use std::os::unix::fs::MetadataExt;
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++use walkdir::WalkDir;
++
++#[derive(Deserialize)]
++struct Descriptor {
++    schema_version: u32,
++    id: String,
++    root: PathBuf,
++}
++
++pub struct InputViewLease {
++    pub id: String,
++    pub root: PathBuf,
++    pub cwd: PathBuf,
++    _lock: File,
++}
++
++fn regular(path: &Path, uid: u32) -> Result<fs::Metadata> {
++    let metadata = fs::symlink_metadata(path)?;
++    ensure!(
++        metadata.is_file() && metadata.uid() == uid && metadata.mode() & 0o777 == 0o600,
++        "input-view control file must be private, regular and owned by the controller"
++    );
++    ensure!(metadata.nlink() == 1, "input-view control file has aliases");
++    Ok(metadata)
++}
++
++impl InputViewLease {
++    pub fn acquire(marker: &Path, cwd: &Path) -> Result<Arc<Self>> {
++        ensure!(
++            marker.file_name().is_some_and(|name| name == "view.json"),
++            "expected an input-view descriptor"
++        );
++        let control = marker
++            .parent()
++            .context("input-view descriptor has no controller")?
++            .canonicalize()?;
++        let metadata = fs::metadata(&control)?;
++        ensure!(
++            metadata.is_dir() && metadata.mode() & 0o777 == 0o700,
++            "input-view controller must be private"
++        );
++        let uid = metadata.uid();
++        let lock_path = control.join("view.lock");
++        let expected = regular(&lock_path, uid)?;
++        let lock = OpenOptions::new().read(true).write(true).open(&lock_path)?;
++        lock.try_lock().context("input view is busy")?;
++        let locked = lock.metadata()?;
++        let current = regular(&lock_path, uid)?;
++        ensure!(
++            expected.dev() == locked.dev()
++                && expected.ino() == locked.ino()
++                && current.dev() == locked.dev()
++                && current.ino() == locked.ino(),
++            "input-view lock changed during acquisition"
++        );
++        let marker = control.join("view.json");
++        let metadata = regular(&marker, uid)?;
++        ensure!(
++            metadata.len() <= 64 * 1024,
++            "input-view descriptor is oversized"
++        );
++        let descriptor: Descriptor = serde_json::from_slice(&fs::read(marker)?)?;
++        ensure!(
++            descriptor.schema_version == 1,
++            "unsupported input-view version"
++        );
++        ensure!(
++            descriptor.id.len() == 32
++                && descriptor
++                    .id
++                    .bytes()
++                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
++            "invalid input-view identity"
++        );
++        let root = control.join("inputs");
++        ensure!(
++            descriptor.root == root && root.canonicalize()? == root,
++            "input-view root does not match its controller"
++        );
++        ensure!(
++            fs::metadata(&root)?.is_dir() && fs::metadata(&root)?.uid() == uid,
++            "input-view root has a different owner"
++        );
++        let cwd = cwd.canonicalize()?;
++        ensure!(
++            cwd.starts_with(&root)
++                && fs::metadata(&cwd)?.is_dir()
++                && fs::metadata(&cwd)?.uid() == uid,
++            "working directory is outside the owned input view"
++        );
++        let lease = Arc::new(Self {
++            id: descriptor.id,
++            root,
++            cwd,
++            _lock: lock,
++        });
++        let view = lease.read_view()?;
++        for entry in WalkDir::new(&lease.root).follow_links(false) {
++            let entry = entry?;
++            if entry.file_type().is_symlink() {
++                view.resolve(entry.path())?;
++            } else {
++                ensure!(
++                    entry.file_type().is_dir() || entry.file_type().is_file(),
++                    "input view contains an unsupported file type"
++                );
++            }
++        }
++        Ok(lease)
++    }
++
++    pub fn read_view(&self) -> Result<Arc<ReadView>> {
++        Ok(Arc::new(ReadView::new(&self.root, &self.cwd)?))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
++    use std::process::Command;
++    use std::sync::atomic::{AtomicU64, Ordering};
++    use std::time::{Duration, Instant};
++
++    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
++
++    struct Fixture(PathBuf);
++
++    impl Fixture {
++        fn new() -> Self {
++            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
++            let root = std::env::temp_dir().join(format!("nni-view-{}-{id}", std::process::id()));
++            fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
++            let fixture = Self(root.canonicalize().unwrap());
++            fs::create_dir(fixture.0.join("inputs")).unwrap();
++            fs::create_dir(fixture.cwd()).unwrap();
++            fs::write(fixture.0.join("view.lock"), b"").unwrap();
++            fs::set_permissions(
++                fixture.0.join("view.lock"),
++                fs::Permissions::from_mode(0o600),
++            )
++            .unwrap();
++            fixture.descriptor(serde_json::json!({"schema_version":1,"id":"0123456789abcdef0123456789abcdef","root":fixture.0.join("inputs"),"provenance":{"test":true}}));
++            fixture
++        }
++
++        fn marker(&self) -> PathBuf {
++            self.0.join("view.json")
++        }
++        fn cwd(&self) -> PathBuf {
++            self.0.join("inputs/build")
++        }
++
++        fn descriptor(&self, value: serde_json::Value) {
++            fs::write(self.marker(), serde_json::to_vec(&value).unwrap()).unwrap();
++            fs::set_permissions(self.marker(), fs::Permissions::from_mode(0o600)).unwrap();
++        }
++
++        fn acquire(&self) -> Result<Arc<InputViewLease>> {
++            InputViewLease::acquire(&self.marker(), &self.cwd())
++        }
++    }
++
++    impl Drop for Fixture {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.0);
++        }
++    }
++
++    fn python_lock(path: &Path) -> i32 {
++        Command::new("python3").args(["-c", "import fcntl,sys\nf=open(sys.argv[1], 'r+')\ntry: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(23)"]).arg(path).status().unwrap().code().unwrap()
++    }
++
++    fn eventually(mut ready: impl FnMut() -> bool) {
++        let deadline = Instant::now() + Duration::from_secs(2);
++        while !ready() {
++            assert!(Instant::now() < deadline, "released lease remained busy");
++            std::thread::sleep(Duration::from_millis(5));
++        }
++    }
++
++    #[test]
++    fn lease_clones_hold_the_same_lock_as_the_python_controller() {
++        let fixture = Fixture::new();
++        let lease = fixture.acquire().unwrap();
++        assert_eq!(lease.id, "0123456789abcdef0123456789abcdef");
++        assert_eq!(lease.cwd, fixture.cwd());
++        assert_eq!(python_lock(&fixture.0.join("view.lock")), 23);
++        assert!(fixture.acquire().is_err());
++        let worker = Arc::clone(&lease);
++        drop(lease);
++        assert_eq!(python_lock(&fixture.0.join("view.lock")), 23);
++        drop(worker);
++        eventually(|| python_lock(&fixture.0.join("view.lock")) == 0);
++        eventually(|| fixture.acquire().is_ok());
++    }
++
++    #[test]
++    fn malformed_identity_roots_and_outside_working_directories_are_rejected() {
++        let fixture = Fixture::new();
++        let original: serde_json::Value =
++            serde_json::from_slice(&fs::read(fixture.marker()).unwrap()).unwrap();
++        for (key, value) in [
++            ("schema_version", serde_json::json!(2)),
++            ("id", serde_json::json!("bad")),
++            ("root", serde_json::json!(fixture.0)),
++        ] {
++            let mut changed = original.clone();
++            changed[key] = value;
++            fixture.descriptor(changed);
++            assert!(fixture.acquire().is_err());
++        }
++        fixture.descriptor(original);
++        assert!(InputViewLease::acquire(&fixture.marker(), &fixture.0).is_err());
++        eventually(|| fixture.acquire().is_ok());
++    }
++
++    #[test]
++    fn aliased_control_files_and_nonprivate_controllers_are_rejected() {
++        let fixture = Fixture::new();
++        let lock = fixture.0.join("view.lock");
++        let target = fixture.0.join("other.lock");
++        fs::rename(&lock, &target).unwrap();
++        std::os::unix::fs::symlink(&target, &lock).unwrap();
++        assert!(fixture.acquire().is_err());
++        fs::remove_file(&lock).unwrap();
++        fs::rename(&target, &lock).unwrap();
++        let marker = fixture.marker();
++        let target = fixture.0.join("other.json");
++        fs::rename(&marker, &target).unwrap();
++        std::os::unix::fs::symlink(&target, &marker).unwrap();
++        assert!(fixture.acquire().is_err());
++        fs::remove_file(&marker).unwrap();
++        fs::rename(&target, &marker).unwrap();
++        fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o755)).unwrap();
++        assert!(fixture.acquire().is_err());
++    }
++
++    #[test]
++    fn link_validation_rejects_uncontrolled_paths_before_scanning() {
++        let fixture = Fixture::new();
++        let source = fixture.0.join("inputs/value.h");
++        fs::write(&source, b"int value;\n").unwrap();
++        let alias = fixture.0.join("inputs/alias.h");
++        std::os::unix::fs::symlink("value.h", &alias).unwrap();
++        let lease = fixture.acquire().unwrap();
++        assert_eq!(
++            lease.read_view().unwrap().resolve(&alias).unwrap(),
++            Some(source)
++        );
++        drop(lease);
++        fs::remove_file(&alias).unwrap();
++        std::os::unix::fs::symlink(fixture.0.join("missing-external"), &alias).unwrap();
++        assert!(fixture.acquire().is_err());
++        fs::remove_file(&alias).unwrap();
++        eventually(|| fixture.acquire().is_ok());
++    }
++}
+diff --git a/crates/nix-ninja/src/lib.rs b/crates/nix-ninja/src/lib.rs
+index 614157b..dc232ac 100644
+--- a/crates/nix-ninja/src/lib.rs
++++ b/crates/nix-ninja/src/lib.rs
+@@ -1,5 +1,11 @@
+ mod build;
+ pub mod cli;
++mod discovery;
++mod discovery_bundle;
++mod discovery_identity;
++mod discovery_policy;
++mod discovery_state;
++mod input_view;
+ mod local;
+ mod relative_from;
+ mod subtool;
+diff --git a/crates/nix-ninja/src/task.rs b/crates/nix-ninja/src/task.rs
+index 04ea300..1196bf5 100644
+--- a/crates/nix-ninja/src/task.rs
++++ b/crates/nix-ninja/src/task.rs
+@@ -1,3 +1,5 @@
++use crate::discovery::{Discovery, Options};
++use crate::discovery_identity::Namespace;
+ use crate::local;
+ use crate::relative_from::relative_from;
+ use crate::subtool::dynamic_task;
+@@ -71,6 +73,7 @@ struct Task {
+     files: HashMap<FileId, File>,
+     inputs: Vec<DerivedFile>,
+     outputs: Vec<PathBuf>,
++    discovery: Option<Arc<Discovery>>,
+ }
+ 
+ impl Deref for Task {
+@@ -95,6 +98,7 @@ pub struct RunnerConfig {
+     pub build_dir: PathBuf,
+     pub store_dir: StoreDir,
+     pub is_output_derivation: bool,
++    pub discovery_options: Option<Arc<Options>>,
+ }
+ 
+ /// Runner is an async runtime that spawns threads for each task.
+@@ -110,6 +114,7 @@ pub struct Runner {
+     wrapper_vars: HashMap<String, String>,
+     wrapper_store_paths: Vec<StorePath>,
+     store_regex: Regex,
++    discovery: Option<Arc<Discovery>>,
+ }
+ 
+ impl Runner {
+@@ -153,6 +158,34 @@ impl Runner {
+             wrapper_store_paths.extend(found_store_paths);
+         }
+ 
++        let discovery = config.discovery_options.as_ref().map(|options| {
++            let tool_paths = [
++                ("cc", &tools.cc),
++                ("coreutils", &tools.coreutils),
++                ("nix", &tools.nix),
++                ("nix-ninja", &tools.nix_ninja),
++                ("nix-ninja-task", &tools.nix_ninja_task),
++                ("patchelf", &tools.patchelf),
++            ]
++            .into_iter()
++            .map(|(name, path)| (name.to_owned(), config.store_dir.display(path).to_string()))
++            .collect();
++            let namespace = Namespace {
++                code_sha256: options.code_sha256.clone(),
++                view_id: options.lease.id.clone(),
++                root: options.lease.root.clone(),
++                cwd: options.lease.cwd.clone(),
++                system: config.system.clone(),
++                store_dir: config.store_dir.to_string().into(),
++                tools: tool_paths,
++                wrapper_vars: wrapper_vars
++                    .iter()
++                    .map(|(key, value)| (key.clone(), value.clone()))
++                    .collect(),
++                search_path: env::var("PATH").unwrap_or_default(),
++            };
++            Arc::new(Discovery::new(options.clone(), namespace))
++        });
+         let (tx, rx) = mpsc::channel();
+         Ok(Runner {
+             derived_files: HashMap::new(),
+@@ -165,9 +198,16 @@ impl Runner {
+             wrapper_vars,
+             wrapper_store_paths,
+             store_regex,
++            discovery,
+         })
+     }
+ 
++    pub fn finish_discovery(&self) {
++        if let Some(discovery) = &self.discovery {
++            discovery.finish();
++        }
++    }
++
+     // Build systems like Meson may generate files via `configure_file` that are
+     // not listed as implicit inputs in the build.ninja file. So we must read
+     // the build directory and consider them implict inputs for all tasks.
+@@ -428,10 +468,21 @@ impl Runner {
+             files: build_files,
+             inputs,
+             outputs,
++            discovery: self.discovery.clone(),
+         })
+     }
+ }
+ 
++impl Drop for Runner {
++    fn drop(&mut self) {
++        if let Some(discovery) = &self.discovery {
++            if let Ok(report) = serde_json::to_string(&discovery.report()) {
++                eprintln!("NNI_DISCOVERY={report}");
++            }
++        }
++    }
++}
++
+ fn build_task_derivation(
+     tools: Tools,
+     rpc_client: &Arc<BuilderRpcClient>,
+@@ -519,14 +570,35 @@ fn build_task_derivation(
+                 })
+                 .collect();
+ 
+-            let (discovered_deps, discovered_store_paths) = discover_c_includes(
+-                rpc_client,
+-                &task.store_dir,
+-                &task.build_dir,
+-                cmdline,
+-                files,
+-                None,
+-            )?;
++            let (discovered_deps, discovered_store_paths) = if let Some(discovery) = &task.discovery
++            {
++                let roots = task
++                    .input_srcs
++                    .iter()
++                    .map(|path| path.to_absolute_path(&task.store_dir))
++                    .collect::<Vec<_>>();
++                let generated = task
++                    .inputs
++                    .iter()
++                    .any(|input| matches!(input.derived_path, SingleDerivedPath::Built { .. }));
++                let includes = discovery.discover(cmdline, files.clone(), &roots, generated)?;
++                materialize_c_includes(
++                    rpc_client,
++                    &task.store_dir,
++                    &task.build_dir,
++                    files,
++                    includes,
++                )?
++            } else {
++                discover_c_includes(
++                    rpc_client,
++                    &task.store_dir,
++                    &task.build_dir,
++                    cmdline,
++                    files,
++                    None,
++                )?
++            };
+ 
+             // Add discovered store paths as input sources only
+             for store_path in discovered_store_paths {
+@@ -924,6 +996,16 @@ pub fn discover_c_includes(
+ ) -> Result<(Vec<DerivedFile>, Vec<StorePath>)> {
+     let c_includes =
+         c_include_parser::retrieve_c_dependency_paths(cmdline, files.clone(), virtual_paths)?;
++    materialize_c_includes(rpc_client, store_dir, build_dir, files, c_includes)
++}
++
++fn materialize_c_includes(
++    rpc_client: &Arc<BuilderRpcClient>,
++    store_dir: &StoreDir,
++    build_dir: &Path,
++    files: Vec<PathBuf>,
++    c_includes: Vec<PathBuf>,
++) -> Result<(Vec<DerivedFile>, Vec<StorePath>)> {
+     let mut discovered_deps = Vec::new();
+     let mut discovered_store_paths = Vec::new();
+ 

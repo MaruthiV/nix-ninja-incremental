@@ -37,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [resolver, profile, corrected-profile, observed, corrected-embed, embed, aliases]
+        variant: [resolver, profile, corrected-profile, observed, corrected-embed, embed, aliases, recording]
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/.work/target-patches
     steps:
