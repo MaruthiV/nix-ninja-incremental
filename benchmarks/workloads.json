@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "stage": "selected before optimization; Zstandard compiler and Ninja checks passed; Nix checks pending",
+  "stage": "baseline and guarded validation pilots complete; protocol fixed before persistent reuse implementation",
   "workloads": [
     {
       "name": "nix",
@@ -10,7 +10,13 @@
       },
       "configuration": "pinned upstream example-nix",
       "target": "src/nix/nix",
-      "selection_reason": "upstream maintainer benchmark request; mixed C++ graph with generated sources"
+      "selection_reason": "upstream maintainer benchmark request; mixed C++ graph with generated sources",
+      "content_probes": {
+        "append": "\n#define NNI_BASELINE_CONTENT_PROBE 1\n",
+        "semantics": "nonsemantic content changes; input identity changes",
+        "implementation": "src/libutil/error.cc",
+        "shared_header": "src/libutil/include/nix/util/error.hh"
+      }
     },
     {
       "name": "zstd",
@@ -29,11 +35,17 @@
         "lz4": "disabled"
       },
       "target": "lib/libzstd.a",
-      "selection_reason": "independent primarily-C library; different graph and dependency structure"
+      "selection_reason": "independent primarily-C library; different graph and dependency structure",
+      "content_probes": {
+        "append": "\n#define NNI_BASELINE_CONTENT_PROBE 1\n",
+        "semantics": "nonsemantic content changes; input identity changes",
+        "implementation": "lib/compress/zstd_compress.c",
+        "shared_header": "lib/common/zstd_internal.h"
+      }
     }
   ],
   "final_protocol": {
-    "status": "not frozen; baseline evidence pending",
+    "status": "frozen before persistent reuse implementation; final timing requires native Linux",
     "paired_repetitions": 10,
     "scenarios": [
       "no-op",
@@ -43,6 +55,29 @@
       "cold-build"
     ],
     "planning_improvement_target": 0.2,
-    "maximum_unexplained_end_to_end_regression": 0.05
+    "maximum_unexplained_end_to_end_regression": 0.05,
+    "seed": 2027,
+    "machine": {
+      "host": "native x86_64 Ubuntu 24.04",
+      "planner_jobs": 4,
+      "container_cpus": 4,
+      "container_memory": "6g",
+      "container_pids": 2048,
+      "nix_max_jobs": 1,
+      "nix_cores": 1
+    },
+    "reference": "same binary with cache disabled versus enabled; matched inputs/tools/store states",
+    "correctness_campaign": {
+      "ci_seeds": 8,
+      "ci_edits_per_seed": 16,
+      "offline_seeds": 256,
+      "offline_edits_per_seed": 32
+    },
+    "store_states": {
+      "planning": "warm tools/generated producers; compiler cache disabled",
+      "warm_end_to_end": "prewarmed union of required edit states for both modes",
+      "cold_full_rebuild": "verified equivalent disposable store resets required",
+      "os_page_cache": "uncontrolled and recorded; no host cache flush"
+    }
   }
 }
