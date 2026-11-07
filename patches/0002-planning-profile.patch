@@ -2,9 +2,7 @@ diff --git a/crates/nix-ninja/src/build.rs b/crates/nix-ninja/src/build.rs
 index 560c981..fe0b69f 100644
 --- a/crates/nix-ninja/src/build.rs
 +++ b/crates/nix-ninja/src/build.rs
-@@ -23,7 +23,11 @@ pub fn build(
-     config: BuildConfig,
-     rpc_client: &Arc<BuilderRpcClient>,
+@@ -25,3 +25,7 @@ pub fn build(
  ) -> Result<DerivedFile> {
 -    let mut loader = load_file(build_filename)?;
 +    let _span = crate::profile::span("planning.total");
@@ -13,11 +11,7 @@ index 560c981..fe0b69f 100644
 +        load_file(build_filename)?
 +    };
  
-     let tools = task::Tools::new(&config.store_dir)?;
- 
-@@ -37,7 +41,10 @@ pub fn build(
-             is_output_derivation: config.is_output_derivation,
-         },
+@@ -39,3 +43,6 @@ pub fn build(
      )?;
 -    runner.read_build_dir(&mut loader.graph.files)?;
 +    {
@@ -25,11 +19,7 @@ index 560c981..fe0b69f 100644
 +        runner.read_build_dir(&mut loader.graph.files)?;
 +    }
  
-     let mut scheduler = Scheduler::new(&mut loader.graph, &mut runner);
- 
-@@ -50,7 +57,10 @@ pub fn build(
-         .lookup(name)
-         .ok_or_else(|| anyhow!("unknown path requested: {}", name))?;
+@@ -52,3 +59,6 @@ pub fn build(
      let _ = scheduler.want_file(fid);
 -    scheduler.run()?;
 +    {
@@ -37,52 +27,34 @@ index 560c981..fe0b69f 100644
 +        scheduler.run()?;
 +    }
  
-     // println!("Successfully generated all derivations");
- 
 diff --git a/crates/nix-ninja/src/cli.rs b/crates/nix-ninja/src/cli.rs
 index 9601db9..c770424 100644
 --- a/crates/nix-ninja/src/cli.rs
 +++ b/crates/nix-ninja/src/cli.rs
-@@ -76,6 +76,7 @@ pub fn run() -> Result<()> {
-             .with_context(|| format!("set_current_dir({})", dir.display()))?;
-     }
+@@ -78,2 +78,3 @@ pub fn run() -> Result<()> {
      let build_dir = std::env::current_dir().context("current_dir")?;
 +    let _report = crate::profile::report(&build_dir)?;
  
-     // Handle subtool if specified
-     if let Some(tool) = cli.tool.clone() {
-@@ -87,6 +88,7 @@ pub fn run() -> Result<()> {
-     if cli.is_output_derivation {
-         submit_outer_output(&cli.store_dir, &derived_file, &rpc_client)?;
+@@ -89,2 +90,3 @@ pub fn run() -> Result<()> {
      } else {
 +        let _span = crate::profile::span("realization.final_output");
          local::symlink_derived_files(&rpc_client, &cli.store_dir, &build_dir, &[derived_file])?;
-     }
-     Ok(())
 diff --git a/crates/nix-ninja/src/lib.rs b/crates/nix-ninja/src/lib.rs
 index 614157b..10537ea 100644
 --- a/crates/nix-ninja/src/lib.rs
 +++ b/crates/nix-ninja/src/lib.rs
-@@ -1,6 +1,7 @@
- mod build;
- pub mod cli;
+@@ -3,2 +3,3 @@ pub mod cli;
  mod local;
 +mod profile;
  mod relative_from;
- mod subtool;
- mod task;
 diff --git a/crates/nix-ninja/src/local.rs b/crates/nix-ninja/src/local.rs
 index 39a30bf..bcc9f66 100644
 --- a/crates/nix-ninja/src/local.rs
 +++ b/crates/nix-ninja/src/local.rs
-@@ -11,6 +11,7 @@ pub fn build_derived_files(
-     store_dir: &StoreDir,
-     derived_files: &[DerivedFile],
+@@ -13,2 +13,3 @@ pub fn build_derived_files(
  ) -> Result<HashMap<PathBuf, PathBuf>> {
 +    let _span = crate::profile::span("realization.generated_inputs");
      let derived_paths: Vec<_> = derived_files
-         .iter()
-         .map(|df| df.derived_path.clone())
 diff --git a/crates/nix-ninja/src/profile.rs b/crates/nix-ninja/src/profile.rs
 new file mode 100644
 index 0000000..c57de15
@@ -190,33 +162,19 @@ diff --git a/crates/nix-ninja/src/task.rs b/crates/nix-ninja/src/task.rs
 index cfab588..04a7a72 100644
 --- a/crates/nix-ninja/src/task.rs
 +++ b/crates/nix-ninja/src/task.rs
-@@ -300,6 +300,7 @@ impl Runner {
-     }
- 
+@@ -302,2 +302,3 @@ impl Runner {
      fn new_task(&mut self, files: &mut graph::GraphFiles, build: &Build) -> Result<Task> {
 +        let _span = crate::profile::span("action.prepare");
          let store_dir = self.config.store_dir.to_string();
- 
-         // Provide the task access to all the original files for explicit
-@@ -436,6 +437,7 @@ fn build_task_derivation(
-     rpc_client: &Arc<BuilderRpcClient>,
-     task: Task,
+@@ -438,2 +439,3 @@ fn build_task_derivation(
  ) -> Result<Derivation> {
 +    let _span = crate::profile::span("action.construct");
      let cmdline = match &task.cmdline {
-         Some(c) => c,
-         None => {
-@@ -740,6 +742,7 @@ fn handle_derivation_result(
-     mut drv: Derivation,
-     config: &RunnerConfig,
+@@ -742,2 +744,3 @@ fn handle_derivation_result(
  ) -> Result<SingleDerivedPath> {
 +    let _span = crate::profile::span("action.resolve");
      // Collect built inputs when deps == "gcc" for dynamic dependency discovery
-     let built_inputs: Vec<DerivedFile> = if task.deps.as_ref() == Some(&"gcc".to_string()) {
-         task.inputs
-@@ -762,7 +765,10 @@ fn handle_derivation_result(
-                 drv,
-                 built_inputs,
+@@ -764,3 +767,6 @@ fn handle_derivation_result(
              )?;
 -            let dynamic_drv_path = rpc_client.add_drv_to_store(&config.store_dir, &dynamic_drv)?;
 +            let dynamic_drv_path = {
@@ -224,11 +182,7 @@ index cfab588..04a7a72 100644
 +                rpc_client.add_drv_to_store(&config.store_dir, &dynamic_drv)?
 +            };
              Ok(SingleDerivedPath::Built {
-                 drv_path: Arc::new(SingleDerivedPath::Opaque(dynamic_drv_path)),
-                 output: "out".parse().unwrap(),
-@@ -790,11 +796,17 @@ fn handle_derivation_result(
-                 &config.store_dir,
-             )?;
+@@ -792,3 +798,6 @@ fn handle_derivation_result(
  
 -            let drv_path = rpc_client.add_drv_to_store(&config.store_dir, &drv)?;
 +            let drv_path = {
@@ -236,7 +190,7 @@ index cfab588..04a7a72 100644
 +                rpc_client.add_drv_to_store(&config.store_dir, &drv)?
 +            };
              Ok(SingleDerivedPath::Opaque(drv_path))
-         }
+@@ -796,3 +805,6 @@ fn handle_derivation_result(
      } else {
 -        let drv_path = rpc_client.add_drv_to_store(&config.store_dir, &drv)?;
 +        let drv_path = {
@@ -244,19 +198,11 @@ index cfab588..04a7a72 100644
 +            rpc_client.add_drv_to_store(&config.store_dir, &drv)?
 +        };
          Ok(SingleDerivedPath::Opaque(drv_path))
-     }
- }
-@@ -865,6 +877,7 @@ fn new_opaque_file(
-     build_dir: &std::path::Path,
-     path: PathBuf,
+@@ -867,2 +879,3 @@ fn new_opaque_file(
  ) -> Result<DerivedFile> {
 +    let _span = crate::profile::span("store.upload_file");
      let relative_path = relative_from(&path, build_dir).unwrap_or(path);
-     let mut path = relative_path
-         .to_str()
-@@ -921,7 +934,10 @@ pub fn discover_c_includes(
-     files: Vec<PathBuf>,
-     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+@@ -923,3 +936,6 @@ pub fn discover_c_includes(
  ) -> Result<(Vec<DerivedFile>, Vec<StorePath>)> {
 -    let c_includes = c_include_parser::retrieve_c_includes(cmdline, files.clone(), virtual_paths)?;
 +    let c_includes = {
@@ -264,5 +210,3 @@ index cfab588..04a7a72 100644
 +        c_include_parser::retrieve_c_includes(cmdline, files.clone(), virtual_paths)?
 +    };
      let mut discovered_deps = Vec::new();
-     let mut discovered_store_paths = Vec::new();
- 

@@ -35,11 +35,12 @@ def verify_base(source):
         raise ValueError("variant revision mismatch")
 
 
-def verify(source, patches):
+def verify(source, patches, variant):
     verify_base(source)
     expected = {}
     for patch in patches:
         expected.update(patch["postimage_sha256"])
+    expected = SERIES.get("variant_postimages", {}).get(variant, expected)
     tracked = output(source, ["diff", "HEAD", "--name-only"]).splitlines()
     untracked = output(source, ["ls-files", "--others", "--exclude-standard"]).splitlines()
     if set(tracked + untracked) != set(expected):
@@ -49,7 +50,7 @@ def verify(source, patches):
             raise ValueError(f"variant content mismatch: {name}")
 
 
-def prepare(source, patches):
+def prepare(source, patches, variant):
     dev.prepare()
     if not source.exists():
         dev.run([
@@ -59,9 +60,10 @@ def prepare(source, patches):
     verify_base(source)
     if not output(source, ["status", "--porcelain"]):
         files = [str(ROOT / "patches" / patch["file"]) for patch in patches]
-        dev.run(["git", "-C", str(source), "apply", "--check", *files])
-        dev.run(["git", "-C", str(source), "apply", *files])
-    verify(source, patches)
+        for file in files:
+            dev.run(["git", "-C", str(source), "apply", "--check", file])
+            dev.run(["git", "-C", str(source), "apply", file])
+    verify(source, patches, variant)
 
 
 def main():
@@ -75,9 +77,9 @@ def main():
         parser.error("variants need a separate worktree under .work/")
     patches = patch_set(args.variant)
     if args.action == "prepare":
-        prepare(source, patches)
+        prepare(source, patches, args.variant)
     else:
-        verify(source, patches)
+        verify(source, patches, args.variant)
     print(f"{args.variant} verified: {source}")
 
 

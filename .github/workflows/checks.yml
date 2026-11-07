@@ -37,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [resolver, profile]
+        variant: [resolver, profile, corrected-profile]
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/.work/target-patches
     steps:
@@ -53,8 +53,8 @@ jobs:
       - name: Workspace tests
         run: cargo +1.95.0 test --locked --workspace --manifest-path .work/nix-ninja-${{ matrix.variant }}/Cargo.toml
       - name: Profiling binary
-        if: matrix.variant == 'profile'
-        run: cargo +1.95.0 build --locked --manifest-path .work/nix-ninja-profile/Cargo.toml -p nix-ninja
+        if: contains(matrix.variant, 'profile')
+        run: cargo +1.95.0 build --locked --manifest-path .work/nix-ninja-${{ matrix.variant }}/Cargo.toml -p nix-ninja
       - name: Profile input isolation and failures
-        if: matrix.variant == 'profile'
+        if: contains(matrix.variant, 'profile')
         run: python3 tests/profile_checks.py --binary .work/target-patches/debug/nix-ninja

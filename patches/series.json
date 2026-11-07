@@ -12,7 +12,7 @@
     },
     {
       "file": "0002-planning-profile.patch",
-      "sha256": "fd9efc18ccc7420799b6ddeacc3420ba7c30258feec2632e715375bddb4c5a39",
+      "sha256": "ae73c937954411f6b656fd6d66a8312d275cabd45b9dc2a6ee4cc7ab609a0d07",
       "purpose": "measurement: opt-in inclusive phase timings without planning reuse",
       "postimage_sha256": {
         "crates/nix-ninja/src/build.rs": "b68881e0fa9000b426b08279258faf360884a31af24fcee28521b5cdb7b4c27a",
@@ -22,6 +22,25 @@
         "crates/nix-ninja/src/profile.rs": "6143f298a963a3e9d8f4c749e8db549d8d3e500d5f9f08793e577f04c8dae0c2",
         "crates/nix-ninja/src/task.rs": "07014670195fc74a08664107731e0869f0fe54af6eaaf8009cf4880cd6fd822c"
       }
+    },
+    {
+      "file": "0003-bounded-planning.patch",
+      "sha256": "3ec06fe1fd722adcedc8a71f514a0c6279c217a10efb751847d1faabad70a988",
+      "purpose": "correctness: bounded action and scanner workers; requires scoped resolution",
+      "postimage_sha256": {
+        "crates/deps-infer/src/c_include_parser.rs": "a4e1e29f8e6e3c5f8b1aced47fd04b4bf2670c6bc5a15cb562bb6c886f3ee6a6",
+        "crates/nix-ninja/src/build.rs": "28412cfe8ee1c6618d1062ab60f1df904a25b4502fc22f26108e660bd518c4eb",
+        "crates/nix-ninja/src/cli.rs": "b46521d459076eaa891abb317db912371cc7fd0d447ee5d278c8358d7baaf2f3",
+        "crates/nix-ninja/src/task.rs": "8c0e96fb693eea74623f2b7e19c941d686ad929765c29444289ceb529109cab9"
+      }
+    },
+    {
+      "file": "0004-compiler-wrapper-environment.patch",
+      "sha256": "6fbe63c4cc96a316214791be4f6ca2c86383ac6a35d6017e01a1217ab8018e27",
+      "purpose": "correctness: preserve compiler hardening environment",
+      "postimage_sha256": {
+        "crates/nix-ninja/src/task.rs": "c8c4ff40139bfdf474850fe08a8989981f91e297d16f7e5a78dbb96b24343431"
+      }
     }
   ],
   "variants": {
@@ -30,6 +49,41 @@
     ],
     "profile": [
       "0002-planning-profile.patch"
+    ],
+    "bounded": [
+      "0001-scoped-path-resolution.patch",
+      "0003-bounded-planning.patch"
+    ],
+    "wrapper-env": [
+      "0004-compiler-wrapper-environment.patch"
+    ],
+    "corrected": [
+      "0001-scoped-path-resolution.patch",
+      "0003-bounded-planning.patch",
+      "0004-compiler-wrapper-environment.patch"
+    ],
+    "corrected-profile": [
+      "0001-scoped-path-resolution.patch",
+      "0003-bounded-planning.patch",
+      "0004-compiler-wrapper-environment.patch",
+      "0002-planning-profile.patch"
     ]
+  },
+  "variant_postimages": {
+    "corrected": {
+      "crates/deps-infer/src/c_include_parser.rs": "a4e1e29f8e6e3c5f8b1aced47fd04b4bf2670c6bc5a15cb562bb6c886f3ee6a6",
+      "crates/nix-ninja/src/build.rs": "28412cfe8ee1c6618d1062ab60f1df904a25b4502fc22f26108e660bd518c4eb",
+      "crates/nix-ninja/src/cli.rs": "b46521d459076eaa891abb317db912371cc7fd0d447ee5d278c8358d7baaf2f3",
+      "crates/nix-ninja/src/task.rs": "0dff81fb83153e3523a7964832d4aadef5cde32543948ccf5fc84d82d7781a61"
+    },
+    "corrected-profile": {
+      "crates/deps-infer/src/c_include_parser.rs": "a4e1e29f8e6e3c5f8b1aced47fd04b4bf2670c6bc5a15cb562bb6c886f3ee6a6",
+      "crates/nix-ninja/src/build.rs": "dd4282f70266b16c7c5276f94a402ba53901c0303730540bf8f84dfd8beb989b",
+      "crates/nix-ninja/src/cli.rs": "18812ad7b901dc0c6c3fe56bee40882c3839e69db897751a4a2086f5cf8e8d75",
+      "crates/nix-ninja/src/lib.rs": "770b4e4377c3796b1aa3f7bcc56f7548ea7409de380953d9750d4d576943de2a",
+      "crates/nix-ninja/src/local.rs": "b394ef0be65ece7809ebbeddd661e12519f15570b51e7c4fcd7c6773260f2efc",
+      "crates/nix-ninja/src/profile.rs": "6143f298a963a3e9d8f4c749e8db549d8d3e500d5f9f08793e577f04c8dae0c2",
+      "crates/nix-ninja/src/task.rs": "a804eb6b2d95c3e9a1a2990fa1b67038f309212e10b6335107e2a3252b8b6f28"
+    }
   }
 }

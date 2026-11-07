@@ -1,0 +1,8 @@
+diff --git a/crates/nix-ninja/src/task.rs b/crates/nix-ninja/src/task.rs
+index cfab588..576b7bf 100644
+--- a/crates/nix-ninja/src/task.rs
++++ b/crates/nix-ninja/src/task.rs
+@@ -133,2 +133,3 @@ impl Runner {
+                 || key.starts_with("NIX_BINTOOLS_WRAPPER")
++                || key == "NIX_HARDENING_ENABLE"
+             {

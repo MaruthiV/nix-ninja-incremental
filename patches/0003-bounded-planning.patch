@@ -1,0 +1,185 @@
+diff --git a/crates/deps-infer/src/c_include_parser.rs b/crates/deps-infer/src/c_include_parser.rs
+index c30d3da..cfe0842 100644
+--- a/crates/deps-infer/src/c_include_parser.rs
++++ b/crates/deps-infer/src/c_include_parser.rs
+@@ -89,3 +89,3 @@ where
+ fn all_sources_with_cache<I, E>(
+-    paths: I,
++    mut paths: I,
+     includes: &[PathBuf],
+@@ -100,41 +100,49 @@ where
+     let virtual_paths = Arc::new(virtual_paths.cloned());
+-    let mut handles = Vec::new();
+-
+-    for entry in paths {
+-        let path = match entry {
+-            Ok(value) => {
+-                canonicalize_with_cache(value.clone(), virtual_paths.as_ref().as_ref(), path_cache)
+-                    .map_err(|e| anyhow!("{:?}", e))?
+-                    .ok_or(anyhow!(
+-                        "Required file not found {}",
+-                        value.to_string_lossy()
+-                    ))?
+-            }
+-            Err(e) => return Err(anyhow!("{:?}", e)),
+-        };
+-        let includes = includes.clone();
+-        let virtual_paths = virtual_paths.clone();
+-        let path_cache = path_cache.clone();
+-
+-        handles.push(std::thread::spawn(move || {
+-            let includes = match extract_includes_with_cache(
+-                &path,
+-                &includes,
+-                virtual_paths.as_ref().as_ref(),
+-                &path_cache,
+-            ) {
+-                Ok(value) => value,
+-                Err(e) => {
+-                    return Err(e);
+-                }
+-            };
+-
+-            Ok(SourceWithIncludes { path, includes })
+-        }));
+-    }
+-
++    let limit = std::thread::available_parallelism()
++        .map(usize::from)
++        .unwrap_or(1);
+     let mut results = Vec::new();
+-    for handle in handles {
+-        let res = handle.join().map_err(|_| anyhow!("Join error"))?;
+-        results.push(res?);
++    loop {
++        let batch = paths
++            .by_ref()
++            .take(limit)
++            .map(|entry| match entry {
++                Ok(value) => canonicalize_with_cache(
++                    value.clone(),
++                    virtual_paths.as_ref().as_ref(),
++                    path_cache,
++                )
++                .map_err(|error| anyhow!("{error:?}"))?
++                .ok_or_else(|| anyhow!("Required file not found {}", value.display())),
++                Err(error) => Err(anyhow!("{error:?}")),
++            })
++            .collect::<Result<Vec<_>>>()?;
++        if batch.is_empty() {
++            break;
++        }
++        let handles: Vec<_> = batch
++            .into_iter()
++            .map(|path| {
++                let includes = includes.clone();
++                let virtual_paths = virtual_paths.clone();
++                let path_cache = path_cache.clone();
++                std::thread::Builder::new().spawn(move || {
++                    let includes = extract_includes_with_cache(
++                        &path,
++                        &includes,
++                        virtual_paths.as_ref().as_ref(),
++                        &path_cache,
++                    )?;
++                    Ok(SourceWithIncludes { path, includes })
++                })
++            })
++            .collect();
++        let joined: Vec<Result<_>> = handles
++            .into_iter()
++            .map(|handle| {
++                let handle = handle?;
++                handle.join().map_err(|_| anyhow!("Join error"))?
++            })
++            .collect();
++        results.extend(joined.into_iter().collect::<Result<Vec<_>>>()?);
+     }
+diff --git a/crates/nix-ninja/src/build.rs b/crates/nix-ninja/src/build.rs
+index 560c981..1495ab8 100644
+--- a/crates/nix-ninja/src/build.rs
++++ b/crates/nix-ninja/src/build.rs
+@@ -17,2 +17,3 @@ pub struct BuildConfig {
+     pub is_output_derivation: bool,
++    pub jobs: usize,
+ }
+@@ -41,3 +42,3 @@ pub fn build(
+ 
+-    let mut scheduler = Scheduler::new(&mut loader.graph, &mut runner);
++    let mut scheduler = Scheduler::new(&mut loader.graph, &mut runner, config.jobs);
+ 
+@@ -220,2 +221,3 @@ struct Scheduler<'a> {
+     build_states: BuildStates,
++    max_jobs: usize,
+ }
+@@ -223,3 +225,3 @@ struct Scheduler<'a> {
+ impl<'a> Scheduler<'a> {
+-    fn new(graph: &'a mut Graph, runner: &'a mut task::Runner) -> Self {
++    fn new(graph: &'a mut Graph, runner: &'a mut task::Runner, jobs: usize) -> Self {
+         let build_count = graph.builds.next_id();
+@@ -230,2 +232,3 @@ impl<'a> Scheduler<'a> {
+             build_states: BuildStates::new(build_count),
++            max_jobs: if jobs == 0 { usize::MAX } else { jobs },
+         }
+@@ -289,5 +292,8 @@ impl<'a> Scheduler<'a> {
+     fn run(&mut self) -> Result<()> {
++        let mut active = 0;
+         while self.build_states.unfinished() {
+-            let mut made_progress = false;
+-            while let Some(bid) = self.build_states.pop_ready() {
++            while active < self.max_jobs {
++                let Some(bid) = self.build_states.pop_ready() else {
++                    break;
++                };
+                 let build = &self.graph.builds[bid];
+@@ -296,7 +302,7 @@ impl<'a> Scheduler<'a> {
+                 self.runner.start(&mut self.graph.files, bid, build)?;
+-                made_progress = true;
++                active += 1;
+             }
+ 
+-            if made_progress {
+-                continue;
++            if active == 0 {
++                bail!("unfinished build graph has no ready or running actions");
+             }
+@@ -304,2 +310,3 @@ impl<'a> Scheduler<'a> {
+             let bid = self.runner.wait(&mut self.graph.files)?;
++            active -= 1;
+             // println!("Derivation for build {:?} has been written", &bid);
+diff --git a/crates/nix-ninja/src/cli.rs b/crates/nix-ninja/src/cli.rs
+index 9601db9..abe33f3 100644
+--- a/crates/nix-ninja/src/cli.rs
++++ b/crates/nix-ninja/src/cli.rs
+@@ -36,3 +36,3 @@ pub struct Cli {
+     /// Run N jobs in parallel (0 means infinity)
+-    #[arg(short = 'j', default_value = "0", hide = true)]
++    #[arg(short = 'j', default_value_t = default_jobs())]
+     pub jobs: usize,
+@@ -134,2 +134,3 @@ fn build(cli: &Cli, build_dir: &Path, rpc_client: &Arc<BuilderRpcClient>) -> Res
+         is_output_derivation: cli.is_output_derivation,
++        jobs: cli.jobs,
+     };
+@@ -153,2 +154,8 @@ fn build(cli: &Cli, build_dir: &Path, rpc_client: &Arc<BuilderRpcClient>) -> Res
+ 
++fn default_jobs() -> usize {
++    std::thread::available_parallelism()
++        .map(usize::from)
++        .unwrap_or(1)
++}
++
+ fn subtool(
+diff --git a/crates/nix-ninja/src/task.rs b/crates/nix-ninja/src/task.rs
+index cfab588..40877e0 100644
+--- a/crates/nix-ninja/src/task.rs
++++ b/crates/nix-ninja/src/task.rs
+@@ -208,3 +208,3 @@ impl Runner {
+         let rpc_client = self.rpc_client.clone();
+-        std::thread::spawn(move || {
++        std::thread::Builder::new().spawn(move || {
+             let (derived_path, err) =
+@@ -245,3 +245,3 @@ impl Runner {
+             let _ = tx.send(result);
+-        });
++        })?;
+ 
