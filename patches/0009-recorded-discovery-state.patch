@@ -2990,3 +2990,15 @@ index 04ea300..1196bf5 100644
      let mut discovered_deps = Vec::new();
      let mut discovered_store_paths = Vec::new();
  
+diff --git a/modules/flake/overlays.nix b/modules/flake/overlays.nix
+index 8904624..bc83f01 100644
+--- a/modules/flake/overlays.nix
++++ b/modules/flake/overlays.nix
+@@ -70,6 +70,7 @@
+         nativeBuildInputs = [
+           self.pkg-config
+         ];
++        nativeCheckInputs = [ self.python3 ];
+       };
+ 
+       # Build *just* the cargo dependencies, so we can reuse

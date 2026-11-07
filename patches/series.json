@@ -84,7 +84,7 @@
     },
     {
       "file": "0009-recorded-discovery-state.patch",
-      "sha256": "b00acbe8e0b8402d5416c10147dddd662e4e89fcdd3a6eb280f219e61f681fcd",
+      "sha256": "c8edaebc9e12f1a3264253df46f4f884f8e42efeb74b169b001a9a9dfaff857b",
       "purpose": "persistence: owned versioned discovery records with mandatory fresh scanning and candidate audits; no build reuse",
       "postimage_sha256": {
         "crates/deps-infer/src/observations.rs": "f4fe104f8f96ac78386a447466038c9a768e85b7dd571b3f3b8c9ab6acf73499",
@@ -97,7 +97,8 @@
         "crates/nix-ninja/src/discovery_state.rs": "96d49b988e14c0c9c53e62fc3aa522636535cd44b0cde754e8ce13c5edeb663d",
         "crates/nix-ninja/src/input_view.rs": "5bbc97065d5ff804198b6ece3bef9dab35340d659b906dbaba16bf9fb3207241",
         "crates/nix-ninja/src/lib.rs": "8f1707c597553be70a262edbe5471cd0266787ad699fc4b2168d0ccdf2efdd6f",
-        "crates/nix-ninja/src/task.rs": "8188dce87894c920f6a7c6f6a1677d57c8083d919b6aa54ac5a3bdf783d30afe"
+        "crates/nix-ninja/src/task.rs": "8188dce87894c920f6a7c6f6a1677d57c8083d919b6aa54ac5a3bdf783d30afe",
+        "modules/flake/overlays.nix": "27bf9edad96498062b70c8088b3407b665ae46b7525e4111a5bcf52f0982f9f6"
       }
     }
   ],
@@ -238,7 +239,8 @@
       "crates/nix-ninja/src/discovery_policy.rs": "d5ed2d0ecc6862f4e3f174de9df6908ea332cf4af4792d6bbdf9b508fecf9466",
       "crates/nix-ninja/src/discovery_state.rs": "96d49b988e14c0c9c53e62fc3aa522636535cd44b0cde754e8ce13c5edeb663d",
       "crates/nix-ninja/src/input_view.rs": "5bbc97065d5ff804198b6ece3bef9dab35340d659b906dbaba16bf9fb3207241",
-      "crates/nix-ninja/src/lib.rs": "8f1707c597553be70a262edbe5471cd0266787ad699fc4b2168d0ccdf2efdd6f"
+      "crates/nix-ninja/src/lib.rs": "8f1707c597553be70a262edbe5471cd0266787ad699fc4b2168d0ccdf2efdd6f",
+      "modules/flake/overlays.nix": "27bf9edad96498062b70c8088b3407b665ae46b7525e4111a5bcf52f0982f9f6"
     }
   }
 }
