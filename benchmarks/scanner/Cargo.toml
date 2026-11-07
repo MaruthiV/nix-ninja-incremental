@@ -1,0 +1,16 @@
+[package]
+name = "nni-scanner-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+deps-infer = { path = "../../.work/nix-ninja/crates/deps-infer" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shell-words = "1"
+
+[[bin]]
+name = "nni-scanner-bench"
+path = "src/main.rs"
