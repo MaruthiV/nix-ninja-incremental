@@ -1,0 +1,103 @@
+diff --git a/crates/nix-ninja/src/discovery_policy.rs b/crates/nix-ninja/src/discovery_policy.rs
+index 1b6513f..58fad18 100644
+--- a/crates/nix-ninja/src/discovery_policy.rs
++++ b/crates/nix-ninja/src/discovery_policy.rs
+@@ -217,9 +217,39 @@ static QUERY: LazyLock<Regex> = LazyLock::new(|| {
+ static QUERY_START: LazyLock<Regex> =
+     LazyLock::new(|| Regex::new(r"__has_(include|embed)\s*\(").unwrap());
+ 
++fn continued_dependency(text: &str) -> bool {
++    let mut joined = String::new();
++    let mut active = false;
++    for line in text.lines() {
++        if let Some(prefix) = line.trim_end().strip_suffix('\\') {
++            joined.push_str(prefix);
++            active = true;
++            continue;
++        }
++        if active {
++            joined.push_str(line);
++            let dependency = DIRECTIVE.captures(&joined).is_some_and(|directive| {
++                matches!(
++                    &directive[1],
++                    "include" | "embed" | "include_next" | "import"
++                )
++            });
++            if dependency || joined.contains("__has_include") || joined.contains("__has_embed") {
++                return true;
++            }
++            joined.clear();
++            active = false;
++        }
++    }
++    false
++}
++
+ fn source(bytes: &[u8]) -> Check<()> {
+     let text = std::str::from_utf8(bytes).map_err(|_| "non-utf8-source")?;
+-    if text.contains("??") {
++    if continued_dependency(text) {
++        return Err("continued-dependency");
++    }
++    if text.contains("??") || text.contains("%:") {
+         return Err("unmodeled-source-transform");
+     }
+     if text.contains("__has_include_next") {
+@@ -412,6 +442,7 @@ mod tests {
+             "#if __has_include(\"probe.h\")\n#define VALUE 1\n#endif\n",
+             "#if __has_include(PICK_HEADER)\n#endif\n",
+             "#inc\\\nlude \"value.h\"\n",
++            "%:include \"value.h\"\n",
+         ] {
+             assert!(source(text.as_bytes()).is_err(), "{text}");
+         }
+@@ -430,6 +461,49 @@ mod tests {
+         assert!(FilePolicy::default().trace(&view, &trace).is_ok());
+     }
+ 
++    #[test]
++    fn continued_dependencies_and_queries_cannot_be_recorded() {
++        for text in [
++            "#\\\ninclude \"value.h\"\n",
++            "#i\\\nnclude \"value.h\"\n",
++            "#in\\\nclu\\\nde \"value.h\"\n",
++            "#i\\   \nnclude \"value.h\"\n",
++            "# \\\r\n embed \"value.bin\"\n",
++            "#if __has_\\\ninclude(\"value.h\")\n#endif\n",
++            "#if __ha\\\ns_embed(\"value.bin\")\n#endif\n",
++            "#define QUERY(x) __has_\\\ninclude(x)\n",
++        ] {
++            assert_eq!(
++                source(text.as_bytes()),
++                Err("continued-dependency"),
++                "{text}"
++            );
++        }
++        assert!(source(
++            concat!(
++                "#define VALUE(x) \\\n",
++                "    ((x) + 1)\n#include \"value.h\"\n"
++            )
++            .as_bytes()
++        )
++        .is_ok());
++    }
++
++    #[test]
++    fn unscanned_continued_headers_are_rejected_by_the_trace_policy() {
++        let fixture = Fixture::new();
++        let main = fixture.write("main.c", "#\\\ninclude \"value.h\"\nint value = VALUE;\n");
++        let header = fixture.write("value.h", "#define VALUE 7\n");
++        let view = Arc::new(ReadView::new(&fixture.0, &fixture.0).unwrap());
++        let (dependencies, trace) =
++            retrieve_c_dependency_paths_observed("cc", vec![main], view.clone()).unwrap();
++        assert!(!dependencies.contains(&header));
++        assert_eq!(
++            FilePolicy::default().trace(&view, &trace),
++            Err("continued-dependency")
++        );
++    }
++
+     #[test]
+     fn mutable_system_paths_and_ambient_search_are_rejected() {
+         let fixture = Fixture::new();

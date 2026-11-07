@@ -72,5 +72,26 @@
     "expected_dependencies": ["main.c"],
     "expected_extra": ["unused.h"],
     "baseline_limitation": "upstream scanner conservatively scans inactive branches"
+  },
+  {
+    "name": "continued-directive-prefix",
+    "files": {"main.c": "#i\\\nnclude \"value.h\"\nint value(void) { return VALUE; }\n", "value.h": "#define VALUE 7\n"},
+    "expected_dependencies": ["main.c", "value.h"],
+    "expected_missing": ["value.h"],
+    "baseline_limitation": "upstream scanner does not splice dependency directive tokens"
+  },
+  {
+    "name": "continued-directive-hash",
+    "files": {"main.c": "#\\\ninclude \"value.h\"\nint value(void) { return VALUE; }\n", "value.h": "#define VALUE 7\n"},
+    "expected_dependencies": ["main.c", "value.h"],
+    "expected_missing": ["value.h"],
+    "baseline_limitation": "upstream scanner does not splice the directive introducer"
+  },
+  {
+    "name": "digraph-directive",
+    "files": {"main.c": "%:include \"value.h\"\nint value(void) { return VALUE; }\n", "value.h": "#define VALUE 7\n"},
+    "expected_dependencies": ["main.c", "value.h"],
+    "expected_missing": ["value.h"],
+    "baseline_limitation": "upstream scanner does not recognize the hash digraph"
   }
 ]

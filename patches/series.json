@@ -100,6 +100,14 @@
         "crates/nix-ninja/src/task.rs": "8188dce87894c920f6a7c6f6a1677d57c8083d919b6aa54ac5a3bdf783d30afe",
         "modules/flake/overlays.nix": "27bf9edad96498062b70c8088b3407b665ae46b7525e4111a5bcf52f0982f9f6"
       }
+    },
+    {
+      "file": "0010-preprocessing-policy.patch",
+      "sha256": "f9945e6b9cb3f880fdf38f5fe8573affa5a3205c220edd873a75b75c5781e299",
+      "purpose": "correctness: bypass recording for spliced dependency directives, queries and hash digraphs",
+      "postimage_sha256": {
+        "crates/nix-ninja/src/discovery_policy.rs": "38239f8edf54af02d922ae3c92f18fd8867a9256680cd9ddbfd29d2441da83cc"
+      }
     }
   ],
   "variants": {
@@ -161,7 +169,8 @@
       "0005-discovery-observations.patch",
       "0007-observed-embedded-resources.patch",
       "0008-logical-dependency-paths.patch",
-      "0009-recorded-discovery-state.patch"
+      "0009-recorded-discovery-state.patch",
+      "0010-preprocessing-policy.patch"
     ]
   },
   "variant_postimages": {
@@ -236,7 +245,7 @@
       "crates/nix-ninja/src/discovery.rs": "aaa1c45784196d4dac16767a58876214372d0733b6dba91f5cfcd11a9b2e1f65",
       "crates/nix-ninja/src/discovery_bundle.rs": "480fdf3879ed8487af3176e94a3192876f1e8413deffb1c8e3044420eff67193",
       "crates/nix-ninja/src/discovery_identity.rs": "b5a9ce3c15d36f868ccafb64f1a39d4547484171656c5bbcd4daa4f9d7de0bbd",
-      "crates/nix-ninja/src/discovery_policy.rs": "d5ed2d0ecc6862f4e3f174de9df6908ea332cf4af4792d6bbdf9b508fecf9466",
+      "crates/nix-ninja/src/discovery_policy.rs": "38239f8edf54af02d922ae3c92f18fd8867a9256680cd9ddbfd29d2441da83cc",
       "crates/nix-ninja/src/discovery_state.rs": "96d49b988e14c0c9c53e62fc3aa522636535cd44b0cde754e8ce13c5edeb663d",
       "crates/nix-ninja/src/input_view.rs": "5bbc97065d5ff804198b6ece3bef9dab35340d659b906dbaba16bf9fb3207241",
       "crates/nix-ninja/src/lib.rs": "8f1707c597553be70a262edbe5471cd0266787ad699fc4b2168d0ccdf2efdd6f",
