@@ -9,6 +9,7 @@ on:
       - tools/build_oracle.py
       - tools/input_view.py
       - tests/fixtures/build_edits.json
+      - tests/fixtures/alias_build_edits.json
       - tests/fixtures/embed.json
       - benchmarks/embedded/**
       - patches/**
@@ -20,6 +21,7 @@ on:
       - tools/build_oracle.py
       - tools/input_view.py
       - tests/fixtures/build_edits.json
+      - tests/fixtures/alias_build_edits.json
       - tests/fixtures/embed.json
       - benchmarks/embedded/**
       - patches/**
@@ -66,6 +68,14 @@ jobs:
           --scanner /workspace/.work/target-embed/release/nni-embed-scanner
           --fixtures /workspace/tests/fixtures/embed.json
           --output /workspace/results/setup/embed-compiler.json'
+      - name: Logical dependency path variant
+        run: python3 tools/variants.py prepare aliases
+      - name: Alias artifact edit oracle
+        run: >-
+          python3 tools/dev.py exec -- nix-shell --impure
+          --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-aliases; }).shell'
+          --run 'python3 /workspace/tools/build_oracle.py
+          && python3 /workspace/tools/build_oracle.py --fixture /workspace/tests/fixtures/alias_build_edits.json'
       - name: Setup records
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f

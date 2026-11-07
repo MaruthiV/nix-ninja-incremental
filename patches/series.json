@@ -72,6 +72,15 @@
         "crates/deps-infer/src/c_include_parser.rs": "7130c65d98d72eff9bc29a6e4016f3ae1a9567a626db7ab0c0c4bb1eb1185922",
         "crates/deps-infer/src/gcc_include_parser.rs": "5fdee09c0cc3f1dd2bd097051e37c0357d178f940dc06a1f4dce05a26e45c126"
       }
+    },
+    {
+      "file": "0008-logical-dependency-paths.patch",
+      "sha256": "3b78004389244cfb2c84c3afbb1ea172d242874b0f9962c4f4ed22823b3a9979",
+      "purpose": "correctness: preserve compiler-facing dependency aliases separately from resolved reads",
+      "postimage_sha256": {
+        "crates/deps-infer/src/c_include_parser.rs": "f87f36c5e89e6c158311549b917e935ed64a294bfac93ab124a9abef196ca567",
+        "crates/nix-ninja/src/task.rs": "5b41beb70ee28af01111644423ffb934d66988c0459d14efe8a86998fdf2eff0"
+      }
     }
   ],
   "variants": {
@@ -117,6 +126,14 @@
       "0004-compiler-wrapper-environment.patch",
       "0005-discovery-observations.patch",
       "0007-observed-embedded-resources.patch"
+    ],
+    "aliases": [
+      "0001-scoped-path-resolution.patch",
+      "0003-bounded-planning.patch",
+      "0004-compiler-wrapper-environment.patch",
+      "0005-discovery-observations.patch",
+      "0007-observed-embedded-resources.patch",
+      "0008-logical-dependency-paths.patch"
     ]
   },
   "variant_postimages": {
@@ -158,6 +175,18 @@
       "crates/nix-ninja/src/build.rs": "28412cfe8ee1c6618d1062ab60f1df904a25b4502fc22f26108e660bd518c4eb",
       "crates/nix-ninja/src/cli.rs": "b46521d459076eaa891abb317db912371cc7fd0d447ee5d278c8358d7baaf2f3",
       "crates/nix-ninja/src/task.rs": "0dff81fb83153e3523a7964832d4aadef5cde32543948ccf5fc84d82d7781a61",
+      "Cargo.lock": "af11193fe1b93126fd453e80101c24480ce0b726d67d7770dc5bdb90c7ea237b",
+      "crates/deps-infer/Cargo.toml": "9b1a75e3a06c72d4aeaa012c1f189173c89180a54166a9856c9f7224d661926a",
+      "crates/deps-infer/examples/trace_cost.rs": "0b38400ee93aafac310be4b57ef22e29e6a4e757b0f90d7684c7488ff10eca13",
+      "crates/deps-infer/src/lib.rs": "971ac1e596dbdcd2d63a6d5d71dbfef2074d4f092c352ee41656361c342e86bc",
+      "crates/deps-infer/src/observations.rs": "fddb1ea4284543375b09bd095a6840f319f27af4894a929183a526304c608fa7",
+      "crates/deps-infer/src/gcc_include_parser.rs": "5fdee09c0cc3f1dd2bd097051e37c0357d178f940dc06a1f4dce05a26e45c126"
+    },
+    "aliases": {
+      "crates/deps-infer/src/c_include_parser.rs": "f87f36c5e89e6c158311549b917e935ed64a294bfac93ab124a9abef196ca567",
+      "crates/nix-ninja/src/build.rs": "28412cfe8ee1c6618d1062ab60f1df904a25b4502fc22f26108e660bd518c4eb",
+      "crates/nix-ninja/src/cli.rs": "b46521d459076eaa891abb317db912371cc7fd0d447ee5d278c8358d7baaf2f3",
+      "crates/nix-ninja/src/task.rs": "5b41beb70ee28af01111644423ffb934d66988c0459d14efe8a86998fdf2eff0",
       "Cargo.lock": "af11193fe1b93126fd453e80101c24480ce0b726d67d7770dc5bdb90c7ea237b",
       "crates/deps-infer/Cargo.toml": "9b1a75e3a06c72d4aeaa012c1f189173c89180a54166a9856c9f7224d661926a",
       "crates/deps-infer/examples/trace_cost.rs": "0b38400ee93aafac310be4b57ef22e29e6a4e757b0f90d7684c7488ff10eca13",

@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "name": "logical-dependency-aliases",
+  "target": "app",
+  "outputs": [
+    "main.o",
+    "lib.o",
+    "app",
+    "main.o.d",
+    "lib.o.d"
+  ],
+  "files": {
+    "main.c": "int value(void);\nint main(void) { return value(); }\n",
+    "lib.c": "int value(void) { return 3; }\n"
+  },
+  "build_ninja": "rule cc\n  command = cc -std=c23 -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nbuild main.o: cc ../source/main.c\nbuild lib.o: cc ../source/lib.c\nbuild app: link main.o lib.o\n",
+  "edits": [
+    {
+      "name": "baseline",
+      "expected_exit": 3
+    },
+    {
+      "name": "directory-resource-alias",
+      "write": {
+        "main.c": "int value(void);\nunsigned char payload[] = {\n#embed \"data-alias/payload.bin\"\n};\nint main(void) { return value() + payload[0]; }\n",
+        "data-one/payload.bin": "D",
+        "data-two/payload.bin": "F"
+      },
+      "symlink": {
+        "data-alias": "data-one"
+      },
+      "expected_exit": 71
+    },
+    {
+      "name": "aliased-resource-bytes",
+      "write": {
+        "data-one/payload.bin": "E"
+      },
+      "preserve_mtime": [
+        "data-one/payload.bin"
+      ],
+      "expected_exit": 72,
+      "stale_probe": true
+    },
+    {
+      "name": "resource-directory-retarget",
+      "remove": [
+        "data-alias"
+      ],
+      "symlink": {
+        "data-alias": "data-two"
+      },
+      "expected_exit": 73,
+      "stale_probe": true
+    },
+    {
+      "name": "resource-file-alias",
+      "write": {
+        "main.c": "int value(void);\nunsigned char payload[] = {\n#embed \"payload.bin\"\n};\nint main(void) { return value() + payload[0]; }\n"
+      },
+      "symlink": {
+        "payload.bin": "data-one/payload.bin"
+      },
+      "expected_exit": 72
+    },
+    {
+      "name": "header-file-alias",
+      "write": {
+        "main.c": "#include \"alias/value.h\"\nint value(void);\nint main(void) { return value() + PAYLOAD; }\n",
+        "real/value.h": "#include \"near.h\"\n#define PAYLOAD NEAR\n",
+        "real/other.h": "#include \"near.h\"\n#define PAYLOAD (NEAR + 1)\n",
+        "real/near.h": "#define NEAR 99\n",
+        "alias/near.h": "#define NEAR 7\n"
+      },
+      "symlink": {
+        "alias/value.h": "../real/value.h"
+      },
+      "expected_exit": 10
+    },
+    {
+      "name": "aliased-header-neighbor-bytes",
+      "write": {
+        "alias/near.h": "#define NEAR 8\n"
+      },
+      "preserve_mtime": [
+        "alias/near.h"
+      ],
+      "expected_exit": 11,
+      "stale_probe": true
+    },
+    {
+      "name": "header-file-retarget",
+      "remove": [
+        "alias/value.h"
+      ],
+      "symlink": {
+        "alias/value.h": "../real/other.h"
+      },
+      "expected_exit": 12,
+      "stale_probe": true
+    },
+    {
+      "name": "source-file-alias",
+      "write": {
+        "real/main.c": "#include \"near.h\"\nint value(void);\nint main(void) { return value() + NEAR; }\n",
+        "real/other.c": "#include \"near.h\"\nint value(void);\nint main(void) { return value() + NEAR + 2; }\n",
+        "near.h": "#define NEAR 9\n"
+      },
+      "remove": [
+        "main.c"
+      ],
+      "symlink": {
+        "main.c": "real/main.c"
+      },
+      "expected_exit": 12
+    },
+    {
+      "name": "source-file-retarget",
+      "remove": [
+        "main.c"
+      ],
+      "symlink": {
+        "main.c": "real/other.c"
+      },
+      "expected_exit": 14,
+      "stale_probe": true
+    },
+    {
+      "name": "header-directory-alias",
+      "remove": [
+        "main.c"
+      ],
+      "write": {
+        "main.c": "#include \"tree/value.h\"\nint value(void);\nint main(void) { return value() + PAYLOAD; }\n"
+      },
+      "symlink": {
+        "tree": "real"
+      },
+      "expected_exit": 102
+    }
+  ]
+}

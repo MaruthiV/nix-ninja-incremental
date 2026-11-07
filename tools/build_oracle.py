@@ -97,10 +97,12 @@ def mutate(source, edit):
 def source_state(source):
     state = {}
     for path in sorted(source.rglob("*")):
+        value = {}
+        if path.is_symlink():
+            value["symlink"] = str(path.readlink())
         if path.is_file():
-            value = {"sha256": digest(path), "mtime_ns": path.stat().st_mtime_ns}
-            if path.is_symlink():
-                value["symlink"] = str(path.readlink())
+            value.update(sha256=digest(path), mtime_ns=path.stat().st_mtime_ns)
+        if value:
             state[str(path.relative_to(source))] = value
     return state
 

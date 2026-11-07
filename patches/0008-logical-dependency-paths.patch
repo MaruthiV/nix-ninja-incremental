@@ -1,0 +1,371 @@
+diff --git a/crates/deps-infer/src/c_include_parser.rs b/crates/deps-infer/src/c_include_parser.rs
+index cdc5680..7c0c2ab 100644
+--- a/crates/deps-infer/src/c_include_parser.rs
++++ b/crates/deps-infer/src/c_include_parser.rs
+@@ -1,6 +1,6 @@
+ use crate::gcc_include_parser;
+ use crate::observations::{DiscoveryTrace, ReadView, Recorder};
+-use anyhow::{anyhow, Result};
++use anyhow::{anyhow, ensure, Result};
+ use regex::Regex;
+ use std::borrow::Borrow;
+ use std::collections::HashMap;
+@@ -10,7 +10,7 @@ use std::fs::canonicalize;
+ use std::fs::File;
+ use std::hash::Hash;
+ use std::io::{BufRead, BufReader, Cursor};
+-use std::path::{Path, PathBuf};
++use std::path::{Component, Path, PathBuf};
+ use std::sync::{Arc, LazyLock, RwLock};
+ 
+ pub fn retrieve_c_includes(
+@@ -19,7 +19,30 @@ pub fn retrieve_c_includes(
+     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+ ) -> Result<Vec<PathBuf>> {
+     let (includes, embeds) = gcc_include_parser::parse_search_dirs(cmdline)?;
+-    bfs_parse_includes(files, &includes, &embeds, virtual_paths, None)
++    bfs_parse_includes(
++        files,
++        &includes,
++        &embeds,
++        virtual_paths,
++        None,
++        &PathCache::default(),
++    )
++}
++
++pub fn retrieve_c_dependency_paths(
++    cmdline: &str,
++    files: Vec<PathBuf>,
++    virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
++) -> Result<Vec<PathBuf>> {
++    let (includes, embeds) = gcc_include_parser::parse_search_dirs(cmdline)?;
++    bfs_parse_includes(
++        files,
++        &includes,
++        &embeds,
++        virtual_paths,
++        None,
++        &PathCache::build_paths(),
++    )
+ }
+ 
+ pub fn retrieve_c_includes_observed(
+@@ -29,7 +52,32 @@ pub fn retrieve_c_includes_observed(
+ ) -> Result<(Vec<PathBuf>, DiscoveryTrace)> {
+     let recorder = Arc::new(Recorder::new(view));
+     let (includes, embeds) = gcc_include_parser::parse_search_dirs(cmdline)?;
+-    let result = bfs_parse_includes(files, &includes, &embeds, None, Some(&recorder))?;
++    let result = bfs_parse_includes(
++        files,
++        &includes,
++        &embeds,
++        None,
++        Some(&recorder),
++        &PathCache::default(),
++    )?;
++    Ok((result, recorder.trace()))
++}
++
++pub fn retrieve_c_dependency_paths_observed(
++    cmdline: &str,
++    files: Vec<PathBuf>,
++    view: Arc<ReadView>,
++) -> Result<(Vec<PathBuf>, DiscoveryTrace)> {
++    let recorder = Arc::new(Recorder::new(view));
++    let (includes, embeds) = gcc_include_parser::parse_search_dirs(cmdline)?;
++    let result = bfs_parse_includes(
++        files,
++        &includes,
++        &embeds,
++        None,
++        Some(&recorder),
++        &PathCache::build_paths(),
++    )?;
+     Ok((result, recorder.trace()))
+ }
+ 
+@@ -40,12 +88,12 @@ fn bfs_parse_includes(
+     embed_dirs: &[PathBuf],
+     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+     observer: Option<&Arc<Recorder>>,
++    path_cache: &PathCache,
+ ) -> Result<Vec<PathBuf>> {
+     let mut visited = HashSet::new();
+     let mut scheduled = HashSet::new();
+     let mut result = Vec::new();
+     let mut queue = VecDeque::new();
+-    let path_cache = PathCache::default();
+ 
+     // Initialize queue with starting files
+     for file in files {
+@@ -58,6 +106,10 @@ fn bfs_parse_includes(
+ 
+     // Process queue in batches until empty
+     while !queue.is_empty() {
++        ensure!(
++            scheduled.len() <= 100_000,
++            "dependency path budget exceeded"
++        );
+         // Get all files currently in the queue
+         let current_batch: Vec<PathBuf> = queue.drain(..).collect();
+ 
+@@ -67,7 +119,7 @@ fn bfs_parse_includes(
+             include_dirs,
+             embed_dirs,
+             virtual_paths.as_ref(),
+-            &path_cache,
++            path_cache,
+             observer,
+         )?;
+ 
+@@ -165,7 +217,7 @@ where
+             .by_ref()
+             .take(limit)
+             .map(|entry| match entry {
+-                Ok(value) => canonicalize_with_cache(
++                Ok(value) => resolve_for_scan(
+                     value.clone(),
+                     virtual_paths.as_ref().as_ref(),
+                     path_cache,
+@@ -220,7 +272,7 @@ static INCLUDE_REGEX: LazyLock<Regex> =
+ ///
+ /// Includes are generally of the form `#include <name>` or `#include "name"`
+ pub fn extract_includes(
+-    path: &PathBuf,
++    path: &Path,
+     include_dirs: &[PathBuf],
+     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+ ) -> Result<Vec<PathBuf>> {
+@@ -236,15 +288,21 @@ pub fn extract_includes(
+ }
+ 
+ fn extract_includes_with_cache(
+-    path: &PathBuf,
++    path: &Path,
+     include_dirs: &[PathBuf],
+     embed_dirs: &[PathBuf],
+     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+     path_cache: &PathCache,
+     observer: Option<&Arc<Recorder>>,
+ ) -> Result<Dependencies> {
++    let read_path = if path_cache.preserve_paths {
++        canonicalize_with_cache(path.to_path_buf(), virtual_paths, path_cache, observer)?
++            .ok_or_else(|| anyhow!("Required file not found {}", path.display()))?
++    } else {
++        path.to_path_buf()
++    };
+     if let Some(observer) = observer {
+-        let bytes = observer.read(path)?;
++        let bytes = observer.read(&read_path)?;
+         extract_from_reader(
+             Cursor::new(bytes.as_slice()),
+             path,
+@@ -255,7 +313,7 @@ fn extract_includes_with_cache(
+             Some(observer),
+         )
+     } else {
+-        let file = File::open(path)
++        let file = File::open(&read_path)
+             .map_err(|error| anyhow!("Failed to open file {}: {}", path.display(), error))?;
+         extract_from_reader(
+             BufReader::new(file),
+@@ -341,14 +399,63 @@ fn try_resolve(
+     path_cache: &PathCache,
+     observer: Option<&Arc<Recorder>>,
+ ) -> Result<Option<PathBuf>> {
+-    match canonicalize_with_cache(head.join(tail), virtual_paths, path_cache, observer) {
++    match resolve_for_scan(head.join(tail), virtual_paths, path_cache, observer) {
+         Ok(result) => Ok(result),
+-        Err(error) if observer.is_some() => Err(error.into()),
++        Err(error) if observer.is_some() || path_cache.preserve_paths => Err(error),
+         Err(_) => Ok(None),
+     }
+ }
+ 
+-type PathCache = Arc<RwLock<HashMap<PathBuf, Option<PathBuf>>>>;
++#[derive(Clone, Default)]
++struct PathCache {
++    paths: Arc<RwLock<HashMap<PathBuf, Option<PathBuf>>>>,
++    preserve_paths: bool,
++}
++
++impl PathCache {
++    fn build_paths() -> Self {
++        Self {
++            preserve_paths: true,
++            ..Self::default()
++        }
++    }
++}
++
++fn resolve_for_scan(
++    path: PathBuf,
++    virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
++    path_cache: &PathCache,
++    observer: Option<&Arc<Recorder>>,
++) -> Result<Option<PathBuf>> {
++    let Some(resolved) =
++        canonicalize_with_cache(path.clone(), virtual_paths, path_cache, observer)?
++    else {
++        return Ok(None);
++    };
++    if !path_cache.preserve_paths {
++        return Ok(Some(resolved));
++    }
++    let mut normalized = PathBuf::new();
++    for component in path.components() {
++        match component {
++            Component::CurDir => {}
++            Component::ParentDir if normalized.file_name().is_some_and(|name| name != "..") => {
++                normalized.pop();
++            }
++            _ => normalized.push(component.as_os_str()),
++        }
++    }
++    if normalized != path {
++        ensure!(
++            canonicalize_with_cache(normalized.clone(), virtual_paths, path_cache, observer)?
++                .as_ref()
++                == Some(&resolved),
++            "parent traversal through a directory alias is unsupported: {}",
++            path.display()
++        );
++    }
++    Ok(Some(normalized))
++}
+ 
+ pub fn canonicalize_cached<P>(
+     path: P,
+@@ -390,7 +497,7 @@ where
+ 
+     {
+         // Then try the cache.
+-        let cache = path_cache.read().unwrap();
++        let cache = path_cache.paths.read().unwrap();
+         if let Some(cached) = cache.get(&path) {
+             return Ok(cached.clone());
+         }
+@@ -403,7 +510,7 @@ where
+         None
+     };
+ 
+-    let mut cache = path_cache.write().unwrap();
++    let mut cache = path_cache.paths.write().unwrap();
+     cache.insert(path.as_ref().to_path_buf(), result.clone());
+ 
+     Ok(result)
+@@ -518,6 +625,99 @@ mod resolver_tests {
+         assert_eq!(scan("cc -c main.c", &source), HashSet::from([source, new]));
+     }
+ 
++    #[cfg(unix)]
++    #[test]
++    fn embedded_alias_keeps_the_compiler_path() {
++        let fixture = Fixture::new();
++        let source = fixture.write(
++            "main.c",
++            "unsigned char data[] = {\n#embed \"alias/data.bin\"\n};\n",
++        );
++        fixture.write("real/data.bin", "A");
++        std::os::unix::fs::symlink("real", fixture.path("alias")).unwrap();
++        let paths = retrieve_c_dependency_paths("cc", vec![source.clone()], None).unwrap();
++        assert_eq!(
++            HashSet::from_iter(paths),
++            HashSet::from([source, fixture.path("alias/data.bin")])
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn header_alias_uses_its_logical_parent() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#include \"alias/value.h\"\n");
++        fixture.write("real/value.h", "#include \"near.h\"\n");
++        fixture.write("real/near.h", "#define VALUE 2\n");
++        let near = fixture.write("alias/near.h", "#define VALUE 1\n");
++        std::os::unix::fs::symlink("../real/value.h", fixture.path("alias/value.h")).unwrap();
++        let paths = retrieve_c_dependency_paths("cc", vec![source.clone()], None).unwrap();
++        assert_eq!(
++            HashSet::from_iter(paths),
++            HashSet::from([source, fixture.path("alias/value.h"), near])
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn source_alias_uses_its_logical_parent() {
++        let fixture = Fixture::new();
++        fixture.write("real/main.c", "#include \"near.h\"\n");
++        fixture.write("real/near.h", "#define VALUE 2\n");
++        let near = fixture.write("alias/near.h", "#define VALUE 1\n");
++        let source = fixture.path("alias/main.c");
++        std::os::unix::fs::symlink("../real/main.c", &source).unwrap();
++        let paths = retrieve_c_dependency_paths("cc", vec![source.clone()], None).unwrap();
++        assert_eq!(HashSet::from_iter(paths), HashSet::from([source, near]));
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn observed_alias_paths_invalidate_on_retarget() {
++        let fixture = Fixture::new();
++        let source = fixture.write(
++            "main.c",
++            "unsigned char data[] = {\n#embed \"alias/data.bin\"\n};\n",
++        );
++        fixture.write("first/data.bin", "A");
++        fixture.write("second/data.bin", "A");
++        let alias = fixture.path("alias");
++        std::os::unix::fs::symlink("first", &alias).unwrap();
++        let view = Arc::new(ReadView::new(&fixture.0, &fixture.0).unwrap());
++        let (paths, trace) =
++            retrieve_c_dependency_paths_observed("cc", vec![source], view).unwrap();
++        assert!(paths.contains(&fixture.path("alias/data.bin")));
++        fs::remove_file(&alias).unwrap();
++        std::os::unix::fs::symlink("second", &alias).unwrap();
++        let view = ReadView::new(&fixture.0, &fixture.0).unwrap();
++        assert!(!view.validate(&trace).unwrap());
++    }
++
++    #[test]
++    fn ordinary_parent_paths_do_not_expand_include_cycles() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#include \"sub/../value.h\"\n");
++        fs::create_dir(fixture.path("sub")).unwrap();
++        let header = fixture.write("value.h", "#include \"sub/../value.h\"\n");
++        let paths = retrieve_c_dependency_paths("cc", vec![source.clone()], None).unwrap();
++        assert_eq!(HashSet::from_iter(paths), HashSet::from([source, header]));
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn parent_traversal_that_changes_alias_meaning_is_rejected() {
++        let fixture = Fixture::new();
++        let source = fixture.write("main.c", "#include \"alias/../value.h\"\n");
++        fixture.write("real/value.h", "#define VALUE 1\n");
++        fixture.write("value.h", "#define VALUE 2\n");
++        fs::create_dir(fixture.path("real/sub")).unwrap();
++        std::os::unix::fs::symlink("real/sub", fixture.path("alias")).unwrap();
++        let error = retrieve_c_dependency_paths("cc", vec![source], None).unwrap_err();
++        assert!(error
++            .to_string()
++            .contains("parent traversal through a directory alias"));
++    }
++
+     #[test]
+     fn virtual_paths_take_precedence() {
+         let fixture = Fixture::new();
+diff --git a/crates/nix-ninja/src/task.rs b/crates/nix-ninja/src/task.rs
+index 1e8f7d9..04ea300 100644
+--- a/crates/nix-ninja/src/task.rs
++++ b/crates/nix-ninja/src/task.rs
+@@ -922,7 +922,8 @@ pub fn discover_c_includes(
+     files: Vec<PathBuf>,
+     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+ ) -> Result<(Vec<DerivedFile>, Vec<StorePath>)> {
+-    let c_includes = c_include_parser::retrieve_c_includes(cmdline, files.clone(), virtual_paths)?;
++    let c_includes =
++        c_include_parser::retrieve_c_dependency_paths(cmdline, files.clone(), virtual_paths)?;
+     let mut discovered_deps = Vec::new();
+     let mut discovered_store_paths = Vec::new();
+ 
