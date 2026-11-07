@@ -1,0 +1,63 @@
+name: full Nix workload
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - environment/**
+      - patches/**
+      - tools/realize.py
+      - tools/workloads.py
+      - tools/input_view.py
+      - benchmarks/workloads.json
+      - .github/workflows/nix-workload.yml
+  pull_request:
+    paths:
+      - environment/**
+      - patches/**
+      - tools/realize.py
+      - tools/workloads.py
+      - tools/input_view.py
+      - benchmarks/workloads.json
+      - .github/workflows/nix-workload.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-workload-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Pinned upstream and correction
+        run: python3 tools/variants.py prepare aliases
+      - name: Isolated Nix daemon
+        run: python3 tools/dev.py up
+      - name: Pinned Nix runtime
+        run: python3 tools/dev.py runtime
+      - name: Environment manifest
+        run: python3 tools/dev.py info
+      - name: Complete Nix target and functional probes
+        run: >-
+          python3 tools/dev.py exec -- nix-shell --impure
+          --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-aliases; cliRuntime = true; }).nixWorkload.shell'
+          --run 'python3 /workspace/tools/realize.py --variant aliases'
+      - name: Compatibility records
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: nix-workload-${{ github.run_id }}
+          path: |
+            results/setup/
+            results/workloads/nix/
+            results/realization/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Stop project daemon
+        if: always()
+        run: python3 tools/dev.py stop

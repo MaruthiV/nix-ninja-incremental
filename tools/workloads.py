@@ -138,6 +138,7 @@ def capture(workload):
         if (view.control / "configure.log").exists():
             shutil.copyfile(view.control / "configure.log", destination / f"{stem}.log")
         print(view.marker, flush=True)
+    return view
 
 
 def check(workload, build_dir):
