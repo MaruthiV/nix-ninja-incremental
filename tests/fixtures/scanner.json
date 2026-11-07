@@ -1,0 +1,76 @@
+[
+  {
+    "name": "literal",
+    "files": {"main.c": "#include \"value.h\"\nint value(void) { return VALUE; }\n", "value.h": "#define VALUE 7\n"},
+    "expected_dependencies": ["main.c", "value.h"]
+  },
+  {
+    "name": "transitive",
+    "files": {"main.c": "#include \"outer.h\"\nint value(void) { return VALUE; }\n", "outer.h": "#include \"inner.h\"\n", "inner.h": "#define VALUE 7\n"},
+    "expected_dependencies": ["main.c", "outer.h", "inner.h"]
+  },
+  {
+    "name": "quoted-precedence",
+    "flags": ["-Iother"],
+    "files": {"main.c": "#include \"value.h\"\nint value(void) { return VALUE; }\n", "value.h": "#define VALUE 7\n", "other/value.h": "#define VALUE 9\n"},
+    "expected_dependencies": ["main.c", "value.h"]
+  },
+  {
+    "name": "search-order",
+    "flags": ["-Ifirst", "-Isecond"],
+    "files": {"main.c": "#include <value.h>\nint value(void) { return VALUE; }\n", "first/value.h": "#define VALUE 7\n", "second/value.h": "#define VALUE 9\n"},
+    "expected_dependencies": ["main.c", "first/value.h"]
+  },
+  {
+    "name": "missing-optional",
+    "flags": ["-Iinclude"],
+    "files": {"main.c": "#if __has_include(\"optional.h\")\n#include \"optional.h\"\n#endif\nint value(void) { return 7; }\n"},
+    "expected_dependencies": ["main.c"]
+  },
+  {
+    "name": "header-spaces",
+    "files": {"main.c": "#include \"value with space.h\"\nint value(void) { return VALUE; }\n", "value with space.h": "#define VALUE 7\n"},
+    "expected_dependencies": ["main.c", "value with space.h"]
+  },
+  {
+    "name": "header-make-escapes",
+    "files": {"main.c": "#include \"value#$.h\"\nint value(void) { return VALUE; }\n", "value#$.h": "#define VALUE 7\n"},
+    "expected_dependencies": ["main.c", "value#$.h"]
+  },
+  {
+    "name": "invalid-source",
+    "files": {"main.c": "#include \"value.h\"\nthis is not valid c\n", "value.h": "#define VALUE 7\n"},
+    "expected_dependencies": ["main.c", "value.h"],
+    "compile_succeeds": false
+  },
+  {
+    "name": "computed-include",
+    "files": {"main.c": "#define HEADER \"value.h\"\n#include HEADER\nint value(void) { return VALUE; }\n", "value.h": "#define VALUE 7\n"},
+    "expected_dependencies": ["main.c", "value.h"],
+    "expected_missing": ["value.h"],
+    "baseline_limitation": "upstream regex does not expand computed includes"
+  },
+  {
+    "name": "forced-include",
+    "flags": ["-include", "value.h"],
+    "files": {"main.c": "int value(void) { return VALUE; }\n", "value.h": "#define VALUE 7\n"},
+    "expected_dependencies": ["main.c", "value.h"],
+    "expected_missing": ["value.h"],
+    "baseline_limitation": "upstream scanner does not read -include"
+  },
+  {
+    "name": "system-include-directory",
+    "flags": ["-isystem", "include"],
+    "files": {"main.c": "#include <value.h>\nint value(void) { return VALUE; }\n", "include/value.h": "#define VALUE 7\n"},
+    "expected_dependencies": ["main.c", "include/value.h"],
+    "expected_missing": ["include/value.h"],
+    "baseline_limitation": "upstream include option parser only handles -I"
+  },
+  {
+    "name": "inactive-include",
+    "files": {"main.c": "#if 0\n#include \"unused.h\"\n#endif\nint value(void) { return 7; }\n", "unused.h": "#define VALUE 7\n"},
+    "expected_dependencies": ["main.c"],
+    "expected_extra": ["unused.h"],
+    "baseline_limitation": "upstream scanner conservatively scans inactive branches"
+  }
+]
