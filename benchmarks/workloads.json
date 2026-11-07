@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "stage": "selected before optimization; Zstandard compiler and Ninja checks passed; Nix checks pending",
+  "workloads": [
+    {
+      "name": "nix",
+      "source": {
+        "url": "https://github.com/NixOS/nix.git",
+        "revision": "bcd3bec7e9cb6561ece0b8e9dc131673bd6072fd"
+      },
+      "configuration": "pinned upstream example-nix",
+      "target": "src/nix/nix",
+      "selection_reason": "upstream maintainer benchmark request; mixed C++ graph with generated sources"
+    },
+    {
+      "name": "zstd",
+      "source": {
+        "url": "https://github.com/facebook/zstd.git",
+        "revision": "f8745da6ff1ad1e7bab384bd1f9d742439278e99",
+        "tag": "v1.5.7"
+      },
+      "meson_source": "build/meson",
+      "meson_options": {
+        "default_library": "static",
+        "bin_programs": false,
+        "bin_tests": false,
+        "zlib": "disabled",
+        "lzma": "disabled",
+        "lz4": "disabled"
+      },
+      "target": "lib/libzstd.a",
+      "selection_reason": "independent primarily-C library; different graph and dependency structure"
+    }
+  ],
+  "final_protocol": {
+    "status": "not frozen; baseline evidence pending",
+    "paired_repetitions": 10,
+    "scenarios": [
+      "no-op",
+      "irrelevant-edit",
+      "implementation-edit",
+      "shared-header-edit",
+      "cold-build"
+    ],
+    "planning_improvement_target": 0.2,
+    "maximum_unexplained_end_to_end_regression": 0.05
+  }
+}

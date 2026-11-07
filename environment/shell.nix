@@ -18,7 +18,5 @@ in pkgs.mkShell {
     gcc
     coreutils
     patchelf
-    nix-ninja
-    nix-ninja-task
   ];
 }
