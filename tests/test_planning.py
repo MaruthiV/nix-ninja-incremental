@@ -41,6 +41,8 @@ class PlanningLeaseTests(unittest.TestCase):
     def test_legacy_lease_and_planner_owned_modes_can_share_one_measurement(self):
         report = self.measure({"legacy": None, "disabled": "off", "recording": "record"})
         self.assertTrue(report["passed"])
+        self.assertTrue(Path(report["cache_root"]).is_relative_to(self.view.control))
+        self.assertFalse(Path(report["cache_root"]).is_relative_to(self.root / "report"))
         self.assertEqual(len({run["derivation_sha256"] for run in report["runs"]}), 1)
         warm = next(run for run in report["runs"] if run["mode"] == "recording" and not run["warmup"])
         self.assertEqual(warm["discovery"]["validated_candidates"], 1)

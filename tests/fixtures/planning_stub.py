@@ -14,6 +14,8 @@ parser.add_argument("--input-view", type=Path)
 parser.add_argument("--discovery-mode")
 parser.add_argument("--discovery-cache", type=Path)
 args = parser.parse_args()
+if sys.argv[-1] != args.target:
+    sys.exit("planner flags must precede the trailing target")
 configuration = json.loads((args.C / "stub.json").read_text())
 control = args.C.parent.parent
 with (control / "view.lock").open("r+") as lock:

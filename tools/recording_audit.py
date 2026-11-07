@@ -42,6 +42,12 @@ def audit(workload, destination):
             ))
             record["coverage"] = [{"warmup": run["warmup"], **run["discovery"]}
                                   for run in report["runs"] if run["mode"] == "record"]
+            with view.lease():
+                state = Path(report["cache_root"]) / "record/state.json"
+                snapshot = destination / "recorded-state.json"
+                shutil.copyfile(state, snapshot)
+                snapshot.chmod(0o644)
+                record["state_sha256"] = realize.digest(snapshot)
             record["input_view"] = view.data
         record["passed"] = True
     except Exception as error:

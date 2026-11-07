@@ -8,6 +8,7 @@ from pathlib import Path
 import random
 import statistics
 import subprocess
+import tempfile
 import time
 
 from input_view import InputView
@@ -63,8 +64,7 @@ def measure(args):
             raise ValueError("discovery modes must uniquely name a binary and use off or record")
         modes[name]["discovery"] = mode
         configured.add(name)
-    if configured:
-        (destination / "cache").mkdir(mode=0o700)
+    cache_root = Path(tempfile.mkdtemp(prefix="planning-state-", dir=view.control)) if configured else None
     capture = json.loads((view.control / "capture.json").read_text())
     if not capture.get("passed"):
         raise ValueError("input-view configuration did not pass")
@@ -76,6 +76,7 @@ def measure(args):
         "pins": json.loads((ROOT / "environment/pins.json").read_text()),
         "patch_series": json.loads((ROOT / "patches/series.json").read_text()),
         "planner_cache": "record-only; every action scans fresh" if configured else "absent",
+        "cache_root": str(cache_root) if cache_root is not None else None,
         "store_state": "uncontrolled before warmups; warmups retained",
         "machine": subprocess.check_output(["uname", "-sm"], text=True).strip(),
         "runs": [], "passed": False,
@@ -96,11 +97,12 @@ def measure(args):
         phases = destination / f"{stem}-phases.json"
         if mode["profile"]:
             run_env["NIX_NINJA_PROFILE"] = str(phases)
-        argv = [mode["binary"], "-C", str(view.root / "build"), f"-j{args.jobs}", "-t", "drv", workload["target"]]
+        argv = [mode["binary"], "-C", str(view.root / "build"), f"-j{args.jobs}", "-t", "drv"]
         discovery = mode.get("discovery")
         if discovery is not None:
             argv += ["--input-view", str(view.marker), "--discovery-mode", discovery,
-                     "--discovery-cache", str(destination / "cache" / name)]
+                     "--discovery-cache", str(cache_root / name)]
+        argv.append(workload["target"])
         before = resources()
         if discovery is not None:
             controller.close()
