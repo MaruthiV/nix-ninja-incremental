@@ -110,7 +110,11 @@ def exec_args(command, interactive=False):
 def probe():
     prepare()
     version = output(exec_args(["nix", "--version"]))
-    if version != f"nix (Nix) {PINS['container']['nix']}":
+    versions = {
+        f"nix (Nix) {PINS['runtime']['version']}",
+        f"nix (Nix) {PINS['container']['nix']}",
+    }
+    if version not in versions:
         raise ValueError(f"Nix version mismatch: {version}")
     manifest = {
         "schema_version": 1,
@@ -119,6 +123,7 @@ def probe():
         "container": CONTAINER,
         "image_id": inspect()["Image"],
         "nix_version": version,
+        "daemon": json.loads(output(exec_args(["nix", "store", "info", "--store", "daemon", "--json"]))),
         "linux": output(exec_args(["uname", "-sm"])),
         "cpu_quota": output(exec_args(["cat", "/sys/fs/cgroup/cpu.max"])),
         "memory_limit": output(exec_args(["cat", "/sys/fs/cgroup/memory.max"])),
@@ -130,13 +135,60 @@ def probe():
     print(json.dumps({key: value for key, value in manifest.items() if key != "pins"}, indent=2))
 
 
-def baseline():
+def runtime():
     prepare()
+    destination = ROOT / "results/setup" / f"runtime-{time.time_ns()}"
+    destination.mkdir(parents=True)
+    expression = '(builtins.getFlake "path:/workspace/.work/nix-ninja").inputs.nix.packages.x86_64-linux.nix-cli'
+    arguments = exec_args(["nix", "build", "--impure", "--expr", expression, "--no-link", "--print-out-paths"])
+    record = {"argv": arguments, "runtime_pin": PINS["runtime"]}
+    start = time.monotonic()
+    try:
+        with (destination / "build.log").open("w") as log:
+            result = subprocess.run(arguments, text=True, stdout=subprocess.PIPE, stderr=log)
+        record.update(returncode=result.returncode, stdout=result.stdout)
+        paths = result.stdout.strip().splitlines()
+        if result.returncode or len(paths) != 1 or not paths[0].startswith("/nix/store/"):
+            raise RuntimeError(f"runtime build failed; see {destination}")
+        path = paths[0]
+        expected = f"nix (Nix) {PINS['runtime']['version']}"
+        if output(exec_args([path + "/bin/nix", "--version"])) != expected:
+            raise ValueError("runtime version mismatch")
+        installed = output(exec_args(["readlink", "-f", "/root/.nix-profile"]))
+        daemon = json.loads(output(exec_args(["nix", "store", "info", "--store", "daemon", "--json"])))
+        record["restarted"] = installed != path or daemon.get("version") != PINS["runtime"]["version"]
+        if record["restarted"]:
+            run(exec_args(["nix-env", "--profile", "/nix/var/nix/profiles/nni-runtime", "--set", path]))
+            run(exec_args(["ln", "-sfn", "/nix/var/nix/profiles/nni-runtime", "/root/.nix-profile"]))
+            run(["docker", "restart", CONTAINER])
+            up()
+        if output(exec_args(["nix", "--version"])) != expected:
+            raise ValueError("container did not select the pinned runtime")
+        record["daemon"] = json.loads(output(exec_args(["nix", "store", "info", "--store", "daemon", "--json"])))
+        if record["daemon"].get("version") != PINS["runtime"]["version"]:
+            raise ValueError("daemon version mismatch")
+        record["passed"] = True
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        record.update(passed=False, error=str(error))
+        raise
+    finally:
+        record["elapsed_seconds"] = time.monotonic() - start
+        (destination / "result.json").write_text(json.dumps(record, indent=2) + "\n")
+    print(f"pinned daemon ready: {PINS['runtime']['version']}")
+
+
+def baseline(cli_runtime=False):
+    prepare()
+    daemon = json.loads(output(exec_args(["nix", "store", "info", "--store", "daemon", "--json"])))
+    if daemon.get("version") != PINS["runtime"]["version"]:
+        raise ValueError("baseline requires the pinned daemon; run python3 tools/dev.py runtime")
     destination = ROOT / "results/setup" / f"baseline-{time.time_ns()}"
     destination.mkdir(parents=True)
     for attempt in range(2):
+        option = "true" if cli_runtime else "false"
+        target = ["--impure", "--expr", f"(import /workspace/environment/baseline.nix {{ cliRuntime = {option}; }}).hello"]
         args = exec_args([
-            "nix", "build", "path:/workspace/.work/nix-ninja#example-hello",
+            "nix", "build", *target,
             "--no-link", "--print-out-paths", "--log-format", "raw",
         ])
         start = time.monotonic()
@@ -147,6 +199,8 @@ def baseline():
             "elapsed_seconds": time.monotonic() - start,
             "stdout": result.stdout,
             "store_state": "initially uncontrolled" if attempt == 0 else "warmed by first attempt",
+            "runtime_package": "nix-cli" if cli_runtime else "nix",
+            "task_work_directory": "NIX_BUILD_TOP/source/build",
         }
         if result.returncode == 0:
             paths = result.stdout.strip().splitlines()
@@ -169,7 +223,7 @@ def baseline():
 
 def main():
     parser = argparse.ArgumentParser(description="Pinned, isolated nix-ninja development environment")
-    parser.add_argument("action", choices=["prepare", "up", "stop", "info", "baseline", "exec", "shell"])
+    parser.add_argument("action", choices=["prepare", "up", "stop", "info", "runtime", "baseline", "exec", "shell"])
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.action == "prepare":
@@ -178,8 +232,12 @@ def main():
         up()
     elif args.action == "info":
         probe()
+    elif args.action == "runtime":
+        runtime()
     elif args.action == "baseline":
-        baseline()
+        if args.command not in [[], ["--cli-runtime"]]:
+            parser.error("baseline accepts only --cli-runtime")
+        baseline(cli_runtime=bool(args.command))
     elif args.action == "stop":
         if inspect() is not None:
             run(["docker", "stop", CONTAINER])
