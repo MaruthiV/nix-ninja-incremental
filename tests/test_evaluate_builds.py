@@ -151,6 +151,23 @@ class BuildEvaluationTests(unittest.TestCase):
             with self.subTest(current=current), self.assertRaises(RuntimeError):
                 evaluate_builds.collection_set([self.base], current)
 
+    def test_object_retention_handles_pinned_directory_outputs_and_legacy_files(self):
+        root = self.root / "object-output"
+        target = root / "src/libcmd/libnixcmd.so.2.36.0.p/installable-derived-path.cc.o"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"object bytes")
+        self.assertEqual(evaluate_builds.retained_object(root), target)
+        self.assertEqual(evaluate_builds.retained_object(target), target)
+
+    def test_object_retention_rejects_missing_objects_and_symlinked_ancestors(self):
+        root = self.root / "object-output"
+        root.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            evaluate_builds.retained_object(root)
+        (root / "src").symlink_to(self.source, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            evaluate_builds.retained_object(root)
+
     def verify_report(self, cold):
         report = self.evaluate(cold=cold)
         report["workload"] = self.workload

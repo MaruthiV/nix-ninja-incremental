@@ -41,6 +41,21 @@ def collection_set(protected, current):
     return selected
 
 
+def retained_object(path):
+    if path.is_symlink():
+        raise RuntimeError("object probe cannot follow a store-output symlink")
+    if path.is_file():
+        return path
+    target = path
+    for component in ["src", "libcmd", "libnixcmd.so.2.36.0.p", "installable-derived-path.cc.o"]:
+        target /= component
+        if target.is_symlink():
+            raise RuntimeError("object probe cannot follow an output-tree symlink")
+    if not target.is_file():
+        raise RuntimeError("the pinned object probe is missing from its output tree")
+    return target
+
+
 def paired_builds(binary, workload, view, destination, report, rounds, seed, cold=False, first_round=0):
     env = dict(os.environ, CCACHE_DISABLE="1", LC_ALL="C", NIX_REMOTE="daemon")
     for key in ["NIX_BUILD_TOP", "NIX_NINJA_DRV", "NIX_NINJA_PROFILE"]:
@@ -139,9 +154,13 @@ def paired_builds(binary, workload, view, destination, report, rounds, seed, col
                     row["object_probes"] = []
                     for path in sorted(inventory(name + "-artifact-inventory")):
                         path = Path(path)
-                        if path.name.endswith("-installable-derived-path.cc.o") and path.is_file():
-                            artifact = retain_artifact(name + "-object-probe-" + path.name[:32], path)
-                            row["object_probes"].append({"path": str(path), "sha256": realize.digest(path), **artifact})
+                        if path.name.endswith("-installable-derived-path.cc.o"):
+                            target_object = retained_object(path)
+                            artifact = retain_artifact(name + "-object-probe-" + path.name[:32], target_object)
+                            row["object_probes"].append({"store_output": str(path), "path": str(target_object),
+                                                         "sha256": realize.digest(target_object), **artifact})
+                    if workload["name"] == "nix" and not row["object_probes"]:
+                        raise RuntimeError("the cold Nix build did not retain its diagnostic object")
             if edits.snapshot() != row["input_state"]:
                 raise RuntimeError(f"build modified the owned source: {name}")
             return row
