@@ -14,7 +14,7 @@ import time
 import evaluate_planning as planning
 from planning import discovery_report
 import realize
-from store_state import build_traces, trace_deletion_set
+from store_state import build_traces, store_path, trace_deletion_set
 import workloads
 
 
@@ -56,7 +56,7 @@ def retained_object(path):
     return target
 
 
-def paired_builds(binary, workload, view, destination, report, rounds, seed, cold=False, first_round=0):
+def paired_builds(binary, workload, view, destination, report, rounds, seed, cold=False, first_round=0, debug_paths=False):
     env = dict(os.environ, CCACHE_DISABLE="1", LC_ALL="C", NIX_REMOTE="daemon")
     for key in ["NIX_BUILD_TOP", "NIX_NINJA_DRV", "NIX_NINJA_PROFILE"]:
         env.pop(key, None)
@@ -67,6 +67,20 @@ def paired_builds(binary, workload, view, destination, report, rounds, seed, col
                   harness_sha256=realize.digest(Path(__file__)), cold=cold, first_round=first_round)
     if cold:
         require_disposable_store()
+        report["cold_control"] = "mapped-debug-paths-v1" if debug_paths else "legacy"
+    if debug_paths:
+        if not cold:
+            raise ValueError("the debug-path control is restricted to cold evaluation")
+        control = ROOT / "benchmarks/cold-debug/control.nix"
+        source = ROOT / ".work/nix-ninja-recording"
+        expression = "import " + str(control) + " { source = " + str(source) + "; }"
+        realize.invoke(["nix", "build", "--impure", "--expr", expression, "--no-link", "--print-out-paths"],
+                       env, destination, "debug-path-helper", report)
+        helper = store_path((destination / "debug-path-helper.stdout").read_text().strip())
+        env["PATH"] = helper + "/bin" + os.pathsep + env["PATH"]
+        report["task_control"] = {"helper": helper, "helper_path": env["PATH"], "expression": expression,
+                                  "sources": {str(path.relative_to(ROOT)): realize.digest(path)
+                                              for path in [control, control.with_name("task-flags.sh"), ROOT / "environment/baseline.nix"]}}
     with ExitStack() as controller:
         controller.enter_context(view.lease())
         view.validate_links()
@@ -281,6 +295,7 @@ def main():
     parser.add_argument("--first-round", type=int, default=0)
     parser.add_argument("--seed", type=int, default=2027)
     parser.add_argument("--expected-binary-sha256", required=True)
+    parser.add_argument("--debug-path-control", choices=["legacy", "mapped"], default="legacy")
     parser.add_argument("--disposable-store", choices=["daemon"])
     args = parser.parse_args()
     if (args.first_round < 0 or args.rounds < 1 or args.first_round + args.rounds > 50
@@ -288,11 +303,14 @@ def main():
         parser.error("warm runs require 10–50 pairs; cold shards require indices within the first 50 pairs")
     if args.kind == "cold" and args.disposable_store != "daemon":
         parser.error("cold runs require explicit --disposable-store daemon")
+    if args.kind != "cold" and args.debug_path_control != "legacy":
+        parser.error("the debug-path control is restricted to cold evaluation")
     workload = next(workload for workload in workloads.WORKLOADS if workload["name"] == args.workload)
     destination = ROOT / "results/evaluation" / f"{args.kind}-{args.workload}-{time.time_ns()}"
     destination.mkdir(parents=True)
     print(destination, flush=True)
-    driver = partial(paired_builds, cold=args.kind == "cold", first_round=args.first_round)
+    driver = partial(paired_builds, cold=args.kind == "cold", first_round=args.first_round,
+                     debug_paths=args.debug_path_control == "mapped")
     planning.evaluate(workload, destination, args.rounds, args.seed, args.expected_binary_sha256,
                       driver=driver, stage="frozen paired end-to-end evaluation")
 

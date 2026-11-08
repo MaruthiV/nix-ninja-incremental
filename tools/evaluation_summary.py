@@ -10,7 +10,7 @@ import statistics
 import evaluate_planning
 from planning import discovery_report
 import realize
-from store_state import trace_deletion_set
+from store_state import store_path, trace_deletion_set
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,6 +86,22 @@ def verified_rows(path, data, kind):
                 with gzip.open(path.parent / row["saved_artifact"], "rb") as artifact:
                     require(hashlib.file_digest(artifact, "sha256").hexdigest() == row["artifact_sha256"],
                             f"retained cold artifact bytes differ: {name}")
+                probes = row.get("object_probes", [])
+                if data.get("cold_control") == "mapped-debug-paths-v1" and data["workload"]["name"] == "nix":
+                    require(len(probes) > 0, "mapped cold Nix data lacks its diagnostic object")
+                seen_outputs = set()
+                for probe in probes:
+                    output = Path(store_path(probe["store_output"]))
+                    require(output not in seen_outputs and output.name.endswith("-installable-derived-path.cc.o"),
+                            "duplicate or unexpected cold object output")
+                    seen_outputs.add(output)
+                    require(probe["path"] in {str(output), str(output / "src/libcmd/libnixcmd.so.2.36.0.p/installable-derived-path.cc.o")},
+                            "cold object file is outside its pinned output layout")
+                    require(probe["saved_artifact"] == f"{name}-object-probe-{output.name[:32]}.artifact.gz",
+                            "unexpected retained cold object filename")
+                    with gzip.open(path.parent / probe["saved_artifact"], "rb") as artifact:
+                        require(hashlib.file_digest(artifact, "sha256").hexdigest() == probe["sha256"],
+                                "retained cold object bytes differ")
         rows[name] = row
     return rows
 
@@ -156,7 +172,28 @@ def verified_store_resets(path, data):
                 "cold paths were not removed with the scoped supported API")
 
 
-def summarize(inputs, destination, kind, rounds, workload_names, binary_sha256, seed=2027):
+def verified_cold_control(path, data, control):
+    require(data.get("cold_control", "legacy") == control, "cold control epochs differ")
+    if control == "legacy":
+        require("task_control" not in data, "legacy cold data contains an undeclared task control")
+        return "legacy"
+    require(control == "mapped-debug-paths-v1", "unknown cold control")
+    task = data["task_control"]
+    helper = store_path(task["helper"])
+    expected = {str(file.relative_to(ROOT)): realize.digest(file) for file in [
+        ROOT / "benchmarks/cold-debug/control.nix", ROOT / "benchmarks/cold-debug/task-flags.sh", ROOT / "environment/baseline.nix"]}
+    require(task["sources"] == expected, "cold task-control sources differ")
+    require(task["helper_path"].split(":")[:2] == [helper + "/bin", str(Path(data["binary"]).parent)],
+            "cold task helper does not precede the frozen CLI in PATH")
+    require((path.parent / "debug-path-helper.stdout").read_text().strip() == helper,
+            "cold helper package output differs")
+    package = data["processes"]["debug-path-helper"]
+    require(package["returncode"] == 0 and package["argv"] == ["nix", "build", "--impure", "--expr", task["expression"],
+                                                             "--no-link", "--print-out-paths"], "cold helper package command differs")
+    return helper + ":" + json.dumps(expected, sort_keys=True)
+
+
+def summarize(inputs, destination, kind, rounds, workload_names, binary_sha256, seed=2027, cold_control="legacy"):
     summary = {"schema_version": 1, "stage": "verified paired evaluation summary", "passed": False,
                "kind": kind, "rounds": rounds, "workloads": workload_names, "binary_sha256": binary_sha256,
                "analysis_seed": seed, "analysis_sha256": realize.digest(Path(__file__)), "sources": [], "results": []}
@@ -171,7 +208,7 @@ def summarize(inputs, destination, kind, rounds, workload_names, binary_sha256, 
         for value in inputs:
             paths.extend(value.rglob("result.json") if value.is_dir() else [value])
         require(len(paths) == len(set(path.resolve() for path in paths)), "duplicate input report")
-        grouped, seen = defaultdict(list), set()
+        grouped, seen, controls = defaultdict(list), set(), set()
         for path in sorted(paths):
             data = json.loads(path.read_text())
             stage = "frozen paired planning evaluation" if kind == "planning" else "frozen paired end-to-end evaluation"
@@ -188,6 +225,7 @@ def summarize(inputs, destination, kind, rounds, workload_names, binary_sha256, 
                     "evaluation machine, seed or resource limits differ")
             rows = verified_rows(path, data, kind)
             if kind == "cold":
+                controls.add(verified_cold_control(path, data, cold_control))
                 verified_store_resets(path, data)
             for pair in data["pairs"]:
                 key = (name, pair["scenario"], pair["round"])
@@ -212,6 +250,9 @@ def summarize(inputs, destination, kind, rounds, workload_names, binary_sha256, 
                                        "capture_ns": data["capture_ns"], "harness_sha256": data["harness_sha256"],
                                        "environment": data["environment"], "machine": data["machine"]})
         require(seen == expected, f"incomplete evaluation: missing {sorted(expected - seen)}")
+        if kind == "cold":
+            require(len(controls) == 1, "cold helper identities differ between shards")
+            summary["cold_control"] = cold_control
         for (name, case), observations in sorted(grouped.items()):
             observations.sort(key=lambda row: row["round"])
             pairs = [(row["modes"]["off"]["elapsed_ns"], row["modes"]["reuse"]["elapsed_ns"]) for row in observations]
@@ -242,11 +283,15 @@ def main():
     parser.add_argument("--rounds", type=int, default=10)
     parser.add_argument("--workloads", nargs="+", choices=["nix", "zstd"], default=["nix", "zstd"])
     parser.add_argument("--expected-binary-sha256", required=True)
+    parser.add_argument("--cold-control", choices=["legacy", "mapped-debug-paths-v1"], default="legacy")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not 10 <= args.rounds <= 50 or len(set(args.workloads)) != len(args.workloads):
         parser.error("final analysis requires 10–50 pairs and distinct workload names")
-    summarize(args.inputs, args.output, args.kind, args.rounds, args.workloads, args.expected_binary_sha256)
+    if args.kind != "cold" and args.cold_control != "legacy":
+        parser.error("a cold task control cannot label planning or warm evaluation")
+    summarize(args.inputs, args.output, args.kind, args.rounds, args.workloads, args.expected_binary_sha256,
+              cold_control=args.cold_control)
 
 
 if __name__ == "__main__":

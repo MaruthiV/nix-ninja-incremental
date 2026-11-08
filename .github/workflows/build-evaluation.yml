@@ -11,12 +11,16 @@ on:
         type: choice
         options: [pilot, remaining, all]
         default: pilot
+      debug_paths:
+        type: choice
+        options: [legacy, mapped]
+        default: legacy
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-evaluation-${{ inputs.kind }}-${{ inputs.cold_rounds }}-${{ github.ref }}
+  group: build-evaluation-${{ inputs.kind }}-${{ inputs.cold_rounds }}-${{ inputs.debug_paths }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -51,12 +55,13 @@ jobs:
           --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).nixWorkload.shell'
           --run 'python3 /workspace/tools/evaluate_builds.py ${{ matrix.workload }} --kind ${{ inputs.kind }}
           --rounds ${{ inputs.kind == 'warm' && '10' || '1' }} --first-round ${{ matrix.round }} --seed 2027
+          --debug-path-control ${{ inputs.debug_paths }}
           --disposable-store daemon --expected-binary-sha256 a9bdf2d1ba5d26a136e1b64602d9e0cc2b56232038e47ce006d3c30bc164052a'
       - name: Evaluation records
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: build-evaluation-${{ inputs.kind }}-${{ matrix.workload }}-${{ matrix.round }}-${{ github.run_id }}
+          name: build-evaluation-${{ inputs.kind }}-${{ inputs.debug_paths }}-${{ matrix.workload }}-${{ matrix.round }}-${{ github.run_id }}
           path: |
             results/setup/
             results/workloads/
