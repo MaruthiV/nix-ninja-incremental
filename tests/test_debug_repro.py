@@ -75,6 +75,14 @@ class DebugReproductionTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(RuntimeError):
                 debug_repro.compare_pairs(rows)
 
+    def test_intermediate_capture_selects_the_owned_store_output_without_requiring_a_local_link(self):
+        protected = "/nix/store/" + "a" * 32 + "-ninja-build-main.o"
+        output = "/nix/store/" + "b" * 32 + "-ninja-build-main.o"
+        self.assertEqual(debug_repro.intermediate_object([protected, output], [protected]), Path(output) / "main.o")
+        for paths in [[protected], [protected, output, "/nix/store/" + "c" * 32 + "-ninja-build-main.o"]]:
+            with self.subTest(paths=paths), self.assertRaisesRegex(RuntimeError, "exactly one"):
+                debug_repro.intermediate_object(paths, [protected])
+
 
 if __name__ == "__main__":
     unittest.main()

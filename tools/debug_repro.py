@@ -11,7 +11,7 @@ from evaluate_builds import collection_set, require_disposable_store
 from input_view import InputView
 from planning import discovery_report
 import realize
-from store_state import build_traces, trace_deletion_set
+from store_state import build_traces, store_path, trace_deletion_set
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +45,14 @@ def compare_pairs(rows):
             raise RuntimeError("mapped debug paths did not produce byte-identical artifacts")
         results[condition] = {"byte_equal": equal, "plan_sha256": pair[0]["plan_sha256"]}
     return results
+
+
+def intermediate_object(paths, protected):
+    candidates = [Path(store_path(value)) for value in set(paths) - set(protected)
+                  if Path(value).name.endswith("-ninja-build-main.o")]
+    if len(candidates) != 1:
+        raise RuntimeError("expected exactly one experiment-owned intermediate object output")
+    return candidates[0] / "main.o"
 
 
 def check(destination):
@@ -135,20 +143,21 @@ def check(destination):
                         report["runs"].append(row)
                         controller.close()
                         try:
-                            command(name, [*argv, "app", "main.o"], current_env)
+                            command(name, [*argv, "app"], current_env)
                         finally:
                             controller.enter_context(view.lease())
                         row["discovery"] = discovery_report((destination / f"{name}.stderr").read_text(), "off")
+                        object_file = intermediate_object(inventory(name + "-artifact-inventory"), protected)
                         for target in ["app", "main.o"]:
-                            artifact = build / target
+                            artifact = build / "app" if target == "app" else object_file
                             archive = destination / f"{name}-{target}.gz"
                             with artifact.open("rb") as input_file, gzip.open(archive, "xb") as output:
                                 shutil.copyfileobj(input_file, output)
                             row["artifacts"][target] = {"path": str(artifact.resolve(strict=True)),
                                                         "sha256": realize.digest(artifact), "saved_artifact": archive.name}
                         command(name + "-probe", [str(build / "app")], current_env)
-                        command(name + "-sections", [readelf, "--sections", "--wide", str(build / "main.o")], current_env)
-                        command(name + "-debug", [readelf, "--debug-dump=info", str(build / "main.o")], current_env)
+                        command(name + "-sections", [readelf, "--sections", "--wide", str(object_file)], current_env)
+                        command(name + "-debug", [readelf, "--debug-dump=info", str(object_file)], current_env)
                         row["debug_info_present"] = ".debug_info" in (destination / f"{name}-sections.stdout").read_text()
                         controller.close()
                         try:
