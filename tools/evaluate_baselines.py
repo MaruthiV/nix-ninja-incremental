@@ -16,6 +16,15 @@ import workloads
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def verify_upstream(source, expected_revision):
+    source = source.resolve(strict=True)
+    git = ["git", "-c", f"safe.directory={source}", "-C", str(source)]
+    revision = workloads.output([*git, "rev-parse", "HEAD"])
+    if revision != expected_revision or workloads.output([*git, "status", "--porcelain"]):
+        raise RuntimeError("unmodified upstream source does not match its clean pin")
+    return revision
+
+
 def comparison_statistics(pairs):
     result = paired_statistics(pairs)
     interval = result["paired_bootstrap_95_interval"]
@@ -49,9 +58,7 @@ def baseline_plans(binary, workload, view, destination, report, rounds, seed):
                   harness_sha256=realize.digest(Path(__file__)), baseline_binaries={})
     binaries = {"current": binary}
     upstream = ROOT / ".work/nix-ninja"
-    revision = workloads.output(["git", "-C", str(upstream), "rev-parse", "HEAD"])
-    if revision != report["pins"]["upstream"]["revision"] or workloads.output(["git", "-C", str(upstream), "status", "--porcelain"]):
-        raise RuntimeError("unmodified upstream source does not match its clean pin")
+    revision = verify_upstream(upstream, report["pins"]["upstream"]["revision"])
     for name, source in [("upstream", upstream), ("corrected", ROOT / ".work/nix-ninja-corrected-embed")]:
         target = destination / name
         target.mkdir()
