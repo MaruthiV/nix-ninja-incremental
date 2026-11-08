@@ -39,6 +39,26 @@ def paired_statistics(pairs, seed=2027, samples=10000):
             "noise_extension_eligible": interval[1] - interval[0] > 0.10}
 
 
+def cost_statistics(observations):
+    result = {"worker_counter_scope": "cumulative worker times overlap; they are not additive elapsed phases",
+              "rss_scope": "CLI and waited children; independent daemon workers excluded",
+              "metadata_bytes_median": statistics.median(row["metadata_bytes"] for row in observations),
+              "controller_ns_median": {name: statistics.median(row[name] for row in observations)
+                                       for name in ["reset_ns", "edit_ns", "cleanup_ns"]}, "modes": {}}
+    for mode in ["off", "reuse"]:
+        rows = [row["modes"][mode] for row in observations]
+        fields = {name: [row[name] for row in rows if name in row]
+                  for name in ["user_cpu_ns", "system_cpu_ns", "max_rss_bytes", "build_reset_ns"]}
+        for name in ["setup_ns", "cumulative_discovery_ns", "cumulative_validation_ns", "publication_ns", "hits", "scans"]:
+            fields[name] = [row["discovery"][name] for row in rows if name in row["discovery"]]
+        for name in ["files_hashed", "bytes_hashed", "resolutions", "retained_bytes"]:
+            fields[name] = [row["discovery"]["observations"][name] for row in rows
+                            if row["discovery"].get("observations") is not None and name in row["discovery"]["observations"]]
+        result["modes"][mode] = {name: {"median": statistics.median(values) if values else None, "samples": len(values)}
+                                  for name, values in fields.items()}
+    return result
+
+
 def verified_rows(path, data, kind):
     rows = {}
     for row in data["runs"]:
@@ -164,7 +184,8 @@ def summarize(inputs, destination, kind, rounds, workload_names, binary_sha256, 
         for (name, case), observations in sorted(grouped.items()):
             observations.sort(key=lambda row: row["round"])
             pairs = [(row["modes"]["off"]["elapsed_ns"], row["modes"]["reuse"]["elapsed_ns"]) for row in observations]
-            result = {"workload": name, "scenario": case, **paired_statistics(pairs, seed), "observations": observations}
+            result = {"workload": name, "scenario": case, **paired_statistics(pairs, seed),
+                      "costs": cost_statistics(observations), "observations": observations}
             threshold = 0.20 if kind == "planning" and case in {"no-op", "implementation-edit"} else None
             if kind != "planning" and case in {"cold-build", "shared-header-edit"}:
                 threshold = -0.05

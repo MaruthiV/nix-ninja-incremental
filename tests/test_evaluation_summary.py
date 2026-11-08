@@ -117,6 +117,14 @@ class EvaluationSummaryTests(unittest.TestCase):
         self.assertAlmostEqual(result["paired_bootstrap_95_interval"][0], -0.2)
         self.assertEqual(result["median_paired_saved_ns"], -20)
 
+    def test_costs_keep_overlapping_work_separate_and_missing_measurements_visible(self):
+        result = self.analyze()
+        costs = result["results"][0]["costs"]
+        self.assertEqual(costs["metadata_bytes_median"], 100)
+        self.assertEqual(costs["modes"]["reuse"]["max_rss_bytes"], {"median": None, "samples": 0})
+        self.assertEqual(costs["modes"]["off"]["hits"], {"median": 0, "samples": 2})
+        self.assertIn("not additive", costs["worker_counter_scope"])
+
 
 if __name__ == "__main__":
     unittest.main()
