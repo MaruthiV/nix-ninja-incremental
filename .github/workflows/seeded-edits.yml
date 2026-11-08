@@ -34,7 +34,7 @@ jobs:
         run: python3 tools/dev.py runtime
       - name: Environment manifest
         run: python3 tools/dev.py info
-      - name: Seeded fresh and recording artifact comparisons
+      - name: Seeded off, record and reuse artifact comparisons
         run: >-
           python3 tools/dev.py exec -- nix-shell --impure
           --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).shell'

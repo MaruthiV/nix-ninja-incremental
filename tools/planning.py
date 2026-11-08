@@ -34,10 +34,14 @@ def discovery_report(stderr, mode):
     report = reports[0]
     if report["schema_version"] != 1 or report["mode"] != mode or not report["planning_complete"]:
         raise RuntimeError("incomplete or incompatible discovery report")
-    if report["hits"] or report["candidate_mismatches"] or report["validation_errors"]:
-        raise RuntimeError("record-only discovery audit failed")
-    if mode == "record" and (report["namespace"] is None or report["publication"] != "published"):
-        raise RuntimeError("discovery recording did not publish state")
+    if (report["candidate_mismatches"] or report["validation_errors"]
+            or (mode != "reuse" and report["hits"])
+            or not 0 <= report["hits"] <= report["calls"]
+            or report["scans"] < 0
+            or report["hits"] + report["scans"] != report["calls"] + report.get("bypasses", {}).get("observation-error", 0)):
+        raise RuntimeError("discovery audit failed")
+    if mode != "off" and (report["namespace"] is None or report["publication"] != "published"):
+        raise RuntimeError("discovery did not publish state")
     return report
 
 
@@ -60,8 +64,8 @@ def measure(args):
     configured = set()
     for specification in args.discovery:
         name, mode = specification.split("=", 1)
-        if name not in modes or name in configured or mode not in {"off", "record"}:
-            raise ValueError("discovery modes must uniquely name a binary and use off or record")
+        if name not in modes or name in configured or mode not in {"off", "record", "reuse"}:
+            raise ValueError("discovery modes must uniquely name a binary and use off, record or reuse")
         modes[name]["discovery"] = mode
         configured.add(name)
     cache_root = Path(tempfile.mkdtemp(prefix="planning-state-", dir=view.control)) if configured else None
@@ -75,7 +79,7 @@ def measure(args):
         "jobs": args.jobs, "repetitions": args.repetitions, "seed": args.seed,
         "pins": json.loads((ROOT / "environment/pins.json").read_text()),
         "patch_series": json.loads((ROOT / "patches/series.json").read_text()),
-        "planner_cache": "record-only; every action scans fresh" if configured else "absent",
+        "planner_cache": "validated discovery; mode recorded per run" if configured else "absent",
         "cache_root": str(cache_root) if cache_root is not None else None,
         "store_state": "uncontrolled before warmups; warmups retained",
         "machine": subprocess.check_output(["uname", "-sm"], text=True).strip(),
@@ -125,11 +129,12 @@ def measure(args):
             raise RuntimeError(f"planning failed: {stem}")
         if discovery is not None:
             record["discovery"] = discovery_report(process.stderr, discovery)
-            if discovery == "record" and not warmup:
+            if discovery in {"record", "reuse"} and not warmup:
                 initial = next(run["discovery"] for run in report["runs"]
                                if run["mode"] == name and run["warmup"])
-                if initial["recorded_actions"] and not record["discovery"]["validated_candidates"]:
-                    raise RuntimeError(f"warm planning did not validate persisted records: {stem}")
+                counter = "validated_candidates" if discovery == "record" else "hits"
+                if initial["recorded_actions"] and not record["discovery"][counter]:
+                    raise RuntimeError(f"warm planning did not exercise persisted records: {stem}")
         value = json.dumps(json.loads(process.stdout), sort_keys=True, separators=(",", ":")).encode()
         record["derivation_sha256"] = hashlib.sha256(value).hexdigest()
         if expected is None:
@@ -173,7 +178,7 @@ def main():
     parser.add_argument("--view", required=True, type=Path)
     parser.add_argument("--binary", action="append", default=[], metavar="NAME=PATH")
     parser.add_argument("--profile", action="append", default=[], metavar="NAME=PATH")
-    parser.add_argument("--discovery", action="append", default=[], metavar="NAME=off|record")
+    parser.add_argument("--discovery", action="append", default=[], metavar="NAME=off|record|reuse")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--seed", type=int, default=2027)

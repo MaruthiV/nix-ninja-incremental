@@ -10,6 +10,7 @@ import subprocess
 import time
 
 from input_view import InputView
+from planning import discovery_report
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -163,13 +164,7 @@ def campaign(binary, fixture_path, destination, discovery_mode=None):
                         controller.enter_context(view.lease())
                 audit = None
                 if discovery_mode is not None:
-                    reports = [json.loads(line.removeprefix("NNI_DISCOVERY="))
-                               for line in result["stderr"].splitlines() if line.startswith("NNI_DISCOVERY=")]
-                    if len(reports) != 1:
-                        raise RuntimeError("expected one discovery report from the planner")
-                    audit = reports[0]
-                    if audit["mode"] != discovery_mode or audit["hits"] or audit["candidate_mismatches"]:
-                        raise RuntimeError("recording audit returned an unexpected reuse or mismatch")
+                    audit = discovery_report(result["stderr"], discovery_mode)
                 return result, audit
 
             previous = None
@@ -195,11 +190,15 @@ def campaign(binary, fixture_path, destination, discovery_mode=None):
                 result, audit = planner()
                 if discovery_mode is not None:
                     step["discovery"] = audit
+                    if discovery_mode == "reuse" and audit["hits"] < edit.get("minimum_reuse_hits", 0):
+                        raise RuntimeError(f"expected dependency reuse did not occur: {edit['name']}")
                     if edit["expected_exit"] is not None:
                         if not audit["planning_complete"]:
                             raise RuntimeError("successful build did not complete planning")
-                        if discovery_mode == "record" and (audit["publication"] != "published" or not audit["recorded_actions"]):
+                        if discovery_mode != "off" and (audit["publication"] != "published" or not audit["recorded_actions"]):
                             raise RuntimeError("successful build did not publish eligible discovery records")
+                        if discovery_mode == "reuse" and len(report["steps"]) == 1 and audit["hits"]:
+                            raise RuntimeError("a cold campaign unexpectedly reused discovery")
                 observed = observe(actual, fixture["target"], result, env)
                 step.update(actual=result, actual_observation=observed)
                 if outcome(observed) != outcome(expected):
@@ -230,6 +229,8 @@ def campaign(binary, fixture_path, destination, discovery_mode=None):
                         step["plan_sha256"] = hashlib.sha256(value).hexdigest()
                         if discovery_mode == "record" and not warm_audit["validated_candidates"]:
                             raise RuntimeError("warm derivation subtool did not audit persisted state")
+                        if discovery_mode == "reuse" and not warm_audit["hits"]:
+                            raise RuntimeError("warm derivation subtool did not reuse persisted state")
                 step["passed"] = True
                 print(f"{edit['name']}: matched fresh build", flush=True)
             if discovery_mode == "record" and not any(step["discovery"]["validated_candidates"] for step in report["steps"]):
@@ -247,7 +248,7 @@ def main():
     parser.add_argument("--binary", type=Path, default=shutil.which("nix-ninja"))
     parser.add_argument("--fixture", type=Path, default=ROOT / "tests/fixtures/build_edits.json")
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--discovery-mode", choices=["off", "record"])
+    parser.add_argument("--discovery-mode", choices=["off", "record", "reuse"])
     args = parser.parse_args()
     if args.binary is None:
         parser.error("--binary or nix-ninja in PATH is required")

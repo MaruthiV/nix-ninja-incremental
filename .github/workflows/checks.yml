@@ -52,9 +52,12 @@ jobs:
         run: cargo +1.95.0 clippy --locked --workspace --all-targets --manifest-path .work/nix-ninja-${{ matrix.variant }}/Cargo.toml -- -D warnings
       - name: Workspace tests
         run: cargo +1.95.0 test --locked --workspace --manifest-path .work/nix-ninja-${{ matrix.variant }}/Cargo.toml
-      - name: Profiling binary
-        if: contains(matrix.variant, 'profile')
+      - name: Planner binary
+        if: contains(matrix.variant, 'profile') || matrix.variant == 'recording'
         run: cargo +1.95.0 build --locked --manifest-path .work/nix-ninja-${{ matrix.variant }}/Cargo.toml -p nix-ninja
       - name: Profile input isolation and failures
         if: contains(matrix.variant, 'profile')
         run: python3 tests/profile_checks.py --binary .work/target-patches/debug/nix-ninja
+      - name: Discovery CLI and controller lease
+        if: matrix.variant == 'recording'
+        run: python3 tests/discovery_cli_checks.py --binary .work/target-patches/debug/nix-ninja

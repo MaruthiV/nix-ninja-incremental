@@ -76,6 +76,12 @@
       "stale_probe": true
     },
     {
+      "name": "unchanged-invalid-source",
+      "expected_exit": null,
+      "diagnostic_file": "lib.c",
+      "minimum_reuse_hits": 2
+    },
+    {
       "name": "source-recovery",
       "write": {
         "lib.c": "#include \"outer.h\"\n#if __has_include(\"bonus.h\")\n#include \"bonus.h\"\n#else\n#define BONUS 0\n#endif\nint value(void) { return VALUE + 2 + BONUS; }\n"

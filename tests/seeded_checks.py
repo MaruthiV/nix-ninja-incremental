@@ -59,12 +59,13 @@ def main():
     parser.add_argument("--reduce-failure", action="store_true")
     parser.add_argument("--reduction-attempts", type=int, default=16)
     args = parser.parse_args()
-    if args.binary is None or args.seeds < 1 or args.edits < 15 or args.reduction_attempts < 1:
-        parser.error("a planner binary, positive seed/attempt counts and at least 15 edits are required")
+    if args.binary is None or args.seeds < 1 or args.edits < len(edit_traces.KINDS) or args.reduction_attempts < 1:
+        parser.error(f"a planner binary, positive seed/attempt counts and at least {len(edit_traces.KINDS)} edits are required")
     binary = Path(args.binary).resolve(strict=True)
     destination = ROOT / "results/campaigns" / f"seeded-{time.time_ns()}"
     destination.mkdir(parents=True)
-    record = {"schema_version": 1, "stage": "seeded off/record artifact campaign; no reuse",
+    record = {"schema_version": 1, "stage": "seeded off/record/reuse artifact campaign",
+              "modes": ["off", "record", "reuse"],
               "passed": False, "binary": str(binary), "binary_sha256": build_oracle.digest(binary),
               "generator_sha256": build_oracle.digest(Path(edit_traces.__file__)),
               "start_seed": args.start_seed, "seeds": args.seeds, "edits_per_seed": args.edits,
@@ -77,7 +78,7 @@ def main():
             write_fixture(fixture, states, seed)
             fixture.with_suffix(".states.json").write_text(json.dumps(states, indent=2) + "\n")
             results = {}
-            for mode in ["off", "record"]:
+            for mode in ["off", "record", "reuse"]:
                 target = destination / f"seed-{seed}-{mode}"
                 target.mkdir()
                 record["current"] = {"seed": seed, "mode": mode, "directory": str(target)}
@@ -93,6 +94,7 @@ def main():
                     raise
                 results[mode] = json.loads((target / "result.json").read_text())
             compare(results["off"], results["record"])
+            compare(results["off"], results["reuse"])
             record["completed"].append({"seed": seed, "states_per_mode": len(states),
                                          "faults_per_mode": sum(step.get("stale_fault_detected", False) for step in results["record"]["steps"])})
         record.pop("current", None)

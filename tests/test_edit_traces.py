@@ -28,6 +28,15 @@ class EditTraceTests(unittest.TestCase):
         self.assertEqual(states, original)
 
     @unittest.skipUnless(shutil.which("ninja") and shutil.which("cc"), "Ninja and a C compiler are required")
+    def test_reference_uses_the_declared_compiler_diagnostic_file(self):
+        value = edit_traces.fixture([edit_traces.generate(2027)[0]], 2027)
+        value["edits"].append({"name": "invalid-main", "write": {"main.c": "int main(void) { return + ; }\n"},
+                               "expected_exit": None, "diagnostic_file": "main.c"})
+        observations = edit_traces.check_reference(value)
+        self.assertEqual(len(observations), 2)
+        self.assertNotEqual(observations[-1]["returncode"], 0)
+
+    @unittest.skipUnless(shutil.which("ninja") and shutil.which("cc"), "Ninja and a C compiler are required")
     def test_eight_seeded_traces_agree_with_fresh_compilation(self):
         for seed in range(2027, 2035):
             with self.subTest(seed=seed):

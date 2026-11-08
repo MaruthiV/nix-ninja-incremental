@@ -28,12 +28,15 @@ with (control / "view.lock").open("r+") as lock:
         sys.exit("unexpected input-view lease ownership")
     print(json.dumps(configuration.get("derivation", {"drvPath": "unchanged"})))
     if args.input_view is not None:
-        record = args.discovery_mode == "record"
+        record = args.discovery_mode in {"record", "reuse"}
         warm = args.discovery_cache.exists()
         args.discovery_cache.mkdir(exist_ok=True)
         audit = {"schema_version": 1, "mode": args.discovery_mode, "planning_complete": True,
-                 "hits": 0, "candidate_mismatches": 0, "validation_errors": 0,
+                 "calls": 1, "scans": int(not (args.discovery_mode == "reuse" and warm)),
+                 "hits": int(args.discovery_mode == "reuse" and warm),
+                 "candidate_mismatches": 0, "validation_errors": 0,
                  "namespace": "fixture", "publication": "published" if record else "disabled",
-                 "recorded_actions": int(record), "validated_candidates": int(record and warm)}
+                 "recorded_actions": int(record),
+                 "validated_candidates": int(args.discovery_mode == "record" and warm)}
         audit.update(configuration.get("audit", {}))
         print("NNI_DISCOVERY=" + json.dumps(audit), file=sys.stderr)

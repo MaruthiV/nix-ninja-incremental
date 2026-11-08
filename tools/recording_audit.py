@@ -47,7 +47,7 @@ def snapshot_unsupported(view, coverage, destination):
 
 def audit(workload, destination):
     record = {"schema_version": 1, "passed": False, "workload": workload,
-              "stage": "record-only eligibility and derivation audit; no reuse or speedup"}
+              "stage": "discovery eligibility and off/record/reuse derivation audit; diagnostic timings"}
     env = dict(os.environ)
     for key in ["NIX_BUILD_TOP", "NIX_NINJA_DRV", "NIX_NINJA_PROFILE"]:
         env.pop(key, None)
@@ -67,11 +67,13 @@ def audit(workload, destination):
                     shutil.copyfile(view.control / name, destination / name)
             report = planning.measure(SimpleNamespace(
                 view=view.marker, output=destination / "planning",
-                binary=[f"off={binary}", f"record={binary}"], profile=[],
-                discovery=["off=off", "record=record"], jobs=4, repetitions=1, seed=2027,
+                binary=[f"off={binary}", f"record={binary}", f"reuse={binary}"], profile=[],
+                discovery=["off=off", "record=record", "reuse=reuse"], jobs=4, repetitions=1, seed=2027,
             ))
             record["coverage"] = [{"warmup": run["warmup"], **run["discovery"]}
                                   for run in report["runs"] if run["mode"] == "record"]
+            record["reuse_coverage"] = [{"warmup": run["warmup"], **run["discovery"]}
+                                        for run in report["runs"] if run["mode"] == "reuse"]
             with view.lease():
                 record["unsupported_samples"] = snapshot_unsupported(view, record["coverage"], destination)
                 state = Path(report["cache_root"]) / "record/state.json"
@@ -79,6 +81,11 @@ def audit(workload, destination):
                 shutil.copyfile(state, snapshot)
                 snapshot.chmod(0o644)
                 record["state_sha256"] = realize.digest(snapshot)
+                state = Path(report["cache_root"]) / "reuse/state.json"
+                snapshot = destination / "reused-state.json"
+                shutil.copyfile(state, snapshot)
+                snapshot.chmod(0o644)
+                record["reuse_state_sha256"] = realize.digest(snapshot)
             record["input_view"] = view.data
         record["passed"] = True
     except Exception as error:

@@ -25,7 +25,7 @@ def compare(disabled, recording):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Recording state versus disabled planning and independent artifacts")
+    parser = argparse.ArgumentParser(description="Discovery modes versus fresh independent artifacts")
     parser.add_argument("--binary", type=Path, default=shutil.which("nix-ninja"))
     args = parser.parse_args()
     if args.binary is None:
@@ -33,21 +33,25 @@ def main():
     binary = Path(args.binary).resolve(strict=True)
     destination = ROOT / "results/recording" / f"check-{time.time_ns()}"
     destination.mkdir(parents=True)
-    record = {"schema_version": 1, "stage": "record-only correctness; no build reuse", "passed": False,
+    record = {"schema_version": 1, "stage": "off/record/reuse artifact and plan correctness", "passed": False,
+              "modes": ["off", "record", "reuse"],
               "binary": str(binary), "binary_sha256": build_oracle.digest(binary), "fixtures": []}
     print(destination, flush=True)
     try:
         for name in ["build_edits.json", "alias_build_edits.json", "presence_build_edits.json"]:
             fixture = ROOT / "tests/fixtures" / name
             results = {}
-            for mode in ["off", "record"]:
+            for mode in ["off", "record", "reuse"]:
                 target = destination / f"{fixture.stem}-{mode}"
                 target.mkdir()
                 build_oracle.campaign(binary, fixture, target, mode)
                 results[mode] = json.loads((target / "result.json").read_text())
             compare(results["off"], results["record"])
+            compare(results["off"], results["reuse"])
             record["fixtures"].append({"name": name, "steps_per_mode": len(results["record"]["steps"]),
-                                       "validated_candidates": sum(step["discovery"]["validated_candidates"] for step in results["record"]["steps"])})
+                                       "validated_candidates": sum(step["discovery"]["validated_candidates"] for step in results["record"]["steps"]),
+                                       "reuse_hits": sum(step["discovery"]["hits"] + step.get("warm_discovery", {}).get("hits", 0)
+                                                         for step in results["reuse"]["steps"])})
         record["passed"] = True
     except Exception as error:
         record["error"] = str(error)

@@ -1,0 +1,384 @@
+diff --git a/crates/nix-ninja/src/cli.rs b/crates/nix-ninja/src/cli.rs
+index 231dccb..7c481f3 100644
+--- a/crates/nix-ninja/src/cli.rs
++++ b/crates/nix-ninja/src/cli.rs
+@@ -74,7 +74,7 @@ pub struct Cli {
+         long,
+         value_enum,
+         default_value = "off",
+-        help = "Record mode audits candidates while always scanning fresh"
++        help = "Record audits fresh scans; reuse skips validated dependency scans"
+     )]
+     pub discovery_mode: Mode,
+ 
+@@ -161,7 +161,7 @@ fn discovery_options(cli: &Cli, build_dir: &Path) -> Result<Option<Arc<Options>>
+     let Some(marker) = &cli.input_view else {
+         anyhow::ensure!(
+             cli.discovery_mode == Mode::Off,
+-            "record mode requires --input-view and --discovery-cache"
++            "persistent discovery requires --input-view and --discovery-cache"
+         );
+         return Ok(None);
+     };
+@@ -171,11 +171,11 @@ fn discovery_options(cli: &Cli, build_dir: &Path) -> Result<Option<Arc<Options>>
+     );
+     anyhow::ensure!(
+         cli.discovery_mode == Mode::Off || cli.discovery_cache.is_some(),
+-        "record mode requires --discovery-cache"
++        "persistent discovery requires --discovery-cache"
+     );
+     let start = Instant::now();
+     let lease = InputViewLease::acquire(marker, build_dir)?;
+-    let code_sha256 = if cli.discovery_mode == Mode::Record {
++    let code_sha256 = if cli.discovery_mode != Mode::Off {
+         code_digest(&std::env::current_exe()?)?
+     } else {
+         String::new()
+diff --git a/crates/nix-ninja/src/discovery.rs b/crates/nix-ninja/src/discovery.rs
+index 5196f3a..01a5d6c 100644
+--- a/crates/nix-ninja/src/discovery.rs
++++ b/crates/nix-ninja/src/discovery.rs
+@@ -33,6 +33,7 @@ pub enum Mode {
+     #[default]
+     Off,
+     Record,
++    Reuse,
+ }
+ 
+ pub struct Options {
+@@ -91,6 +92,7 @@ pub struct Discovery {
+     policy: Mutex<FilePolicy>,
+     state: Mutex<State>,
+     calls: AtomicU64,
++    hits: AtomicU64,
+     scans: AtomicU64,
+     discovery_ns: AtomicU64,
+     validation_ns: AtomicU64,
+@@ -117,15 +119,14 @@ impl Discovery {
+         let mut identity = None;
+         let mut view = None;
+         let mut previous = Bundle::empty();
+-        if options.mode == Mode::Record {
++        if options.mode != Mode::Off {
+             let prepared = (|| -> Result<_> {
+                 let identity = Identity::new(&namespace)?;
+                 let view = options.lease.read_view()?;
+                 let directory = Directory::open(
+-                    options
+-                        .cache_dir
+-                        .as_deref()
+-                        .ok_or_else(|| anyhow::anyhow!("record mode requires a cache directory"))?,
++                    options.cache_dir.as_deref().ok_or_else(|| {
++                        anyhow::anyhow!("persistent discovery requires a cache directory")
++                    })?,
+                     &options.lease.root,
+                 )?;
+                 Ok((identity, view, directory))
+@@ -165,6 +166,7 @@ impl Discovery {
+             policy: Mutex::default(),
+             state: Mutex::new(state),
+             calls: AtomicU64::new(0),
++            hits: AtomicU64::new(0),
+             scans: AtomicU64::new(0),
+             discovery_ns: AtomicU64::new(0),
+             validation_ns: AtomicU64::new(0),
+@@ -344,6 +346,20 @@ impl Discovery {
+                 validation_start.elapsed().as_nanos() as u64,
+                 Ordering::Relaxed,
+             );
++            let candidate = match candidate {
++                Some(dependencies) if self.options.mode == Mode::Reuse => {
++                    let mut state = self.state.lock().unwrap();
++                    if !state.finished
++                        && (state.used.contains(&key) || state.used.len() < MAX_RECORDS)
++                    {
++                        state.used.insert(key);
++                        self.hits.fetch_add(1, Ordering::Relaxed);
++                        return Ok(dependencies);
++                    }
++                    Some(dependencies)
++                }
++                other => other,
++            };
+             self.scans.fetch_add(1, Ordering::Relaxed);
+             let (dependencies, mut trace) =
+                 match retrieve_c_dependency_paths_observed(command, sources, view.clone()) {
+@@ -444,17 +460,17 @@ impl Discovery {
+         let state = self.state.lock().unwrap();
+         Report {
+             schema_version: 1,
+-            mode: if self.options.mode == Mode::Off {
+-                "off"
+-            } else {
+-                "record"
++            mode: match self.options.mode {
++                Mode::Off => "off",
++                Mode::Record => "record",
++                Mode::Reuse => "reuse",
+             },
+             namespace: self
+                 .identity
+                 .as_ref()
+                 .map(|identity| identity.namespace.clone()),
+             calls: self.calls.load(Ordering::Relaxed),
+-            hits: 0,
++            hits: self.hits.load(Ordering::Relaxed),
+             validated_candidates: self.validated.load(Ordering::Relaxed),
+             candidate_mismatches: self.mismatches.load(Ordering::Relaxed),
+             validation_errors: self.validation_errors.load(Ordering::Relaxed),
+@@ -576,9 +592,12 @@ mod tests {
+             Some(context)
+         }
+         fn scan(&self, context: &Discovery) -> Vec<PathBuf> {
++            self.scan_command(context, "cc -c main.c")
++        }
++        fn scan_command(&self, context: &Discovery, command: &str) -> Vec<PathBuf> {
+             context
+                 .discover_resolved(
+-                    "cc -c main.c",
++                    command,
+                     vec![self.cwd().join("main.c")],
+                     &[],
+                     Some(Path::new(
+@@ -628,6 +647,182 @@ mod tests {
+         assert_eq!(context.report().recorded_actions, 1);
+     }
+ 
++    #[test]
++    fn reuse_skips_scans_and_retains_records_across_publications() {
++        let fixture = Fixture::new();
++        let main = fixture.write("main.c", "#include \"value.h\"\n");
++        let header = fixture.write("value.h", "int value;\n");
++        let expected = HashSet::from([main, header.clone()]);
++        let context = fixture.context(Mode::Reuse);
++        assert_eq!(HashSet::from_iter(fixture.scan(&context)), expected);
++        assert_eq!(context.report().scans, 1);
++        assert_eq!(context.report().hits, 0);
++        context.finish();
++        drop(context);
++        for _ in 0..3 {
++            let context = fixture.context(Mode::Reuse);
++            assert_eq!(context.report().loaded_records, 1);
++            assert_eq!(HashSet::from_iter(fixture.scan(&context)), expected);
++            assert_eq!(context.report().hits, 1);
++            assert_eq!(context.report().scans, 0);
++            assert_eq!(context.report().validated_candidates, 0);
++            context.finish();
++            assert_eq!(context.report().publication, "published");
++            drop(context);
++        }
++        let before = fs::metadata(&header).unwrap();
++        fixture.write("value.h", "int changed;\n");
++        fs::File::open(&header)
++            .unwrap()
++            .set_times(fs::FileTimes::new().set_modified(before.modified().unwrap()))
++            .unwrap();
++        let context = fixture.context(Mode::Reuse);
++        assert_eq!(HashSet::from_iter(fixture.scan(&context)), expected);
++        assert_eq!(context.report().hits, 0);
++        assert_eq!(context.report().scans, 1);
++    }
++
++    #[test]
++    fn reuse_tracks_negative_searches_aliases_commands_and_leaf_kinds() {
++        let fixture = Fixture::new();
++        let main = fixture.write(
++            "main.c",
++            "#include \"alias.h\"\n#if __has_include(<probe.h>)\n#endif\n",
++        );
++        fixture.write("early/keep", "unused");
++        let late = fixture.write("late/probe.h", "not c");
++        fixture.write("first.h", "int value;\n");
++        fixture.write("second.h", "int value;\n");
++        let alias = fixture.cwd().join("alias.h");
++        std::os::unix::fs::symlink("first.h", &alias).unwrap();
++        let command = |reverse: bool| {
++            let directories = if reverse {
++                ["late", "early"]
++            } else {
++                ["early", "late"]
++            };
++            shell_words::join([
++                "cc".into(),
++                format!("-I{}", fixture.cwd().join(directories[0]).display()),
++                format!("-I{}", fixture.cwd().join(directories[1]).display()),
++                "-c".into(),
++                "main.c".into(),
++            ])
++        };
++        let check = |reverse, expected: &Path, hit: bool| {
++            let context = fixture.context(Mode::Reuse);
++            let paths = fixture.scan_command(&context, &command(reverse));
++            assert_eq!(
++                HashSet::from_iter(paths),
++                HashSet::from([main.clone(), alias.clone(), expected.to_owned()])
++            );
++            assert_eq!(context.report().hits, u64::from(hit));
++            assert_eq!(context.report().scans, u64::from(!hit));
++            context.finish();
++        };
++        check(false, &late, false);
++        fixture.write("late/probe.h", "changed leaf data");
++        check(false, &late, true);
++        let early = fixture.write("early/probe.h", "earlier");
++        check(false, &early, false);
++        fs::remove_file(&alias).unwrap();
++        std::os::unix::fs::symlink("second.h", &alias).unwrap();
++        check(false, &early, false);
++        check(true, &late, false);
++        fs::remove_file(&late).unwrap();
++        fs::create_dir(&late).unwrap();
++        check(true, &early, false);
++    }
++
++    #[test]
++    fn reuse_keeps_current_policy_and_recovers_from_corrupt_state() {
++        let fixture = Fixture::new();
++        let main = fixture.write("main.c", "int value;\n");
++        let context = fixture.context(Mode::Record);
++        fixture.scan(&context);
++        context.finish();
++        drop(context);
++        let mut context = fixture.context(Mode::Reuse);
++        Arc::get_mut(&mut context.options).unwrap().ambient_search = true;
++        assert_eq!(fixture.scan(&context), vec![main.clone()]);
++        assert_eq!(context.report().hits, 0);
++        assert_eq!(context.report().scans, 1);
++        assert!(!context.report().bypasses.is_empty());
++        drop(context);
++        let context = fixture.context(Mode::Reuse);
++        assert_eq!(
++            context
++                .discover("cc -c main.c", vec![main.clone()], &[], true)
++                .unwrap(),
++            vec![main.clone()]
++        );
++        assert_eq!(context.report().hits, 0);
++        assert_eq!(context.report().bypasses["generated-input"], 1);
++        drop(context);
++        fs::write(fixture.0.join("state/state.json"), b"{").unwrap();
++        let context = fixture.context(Mode::Reuse);
++        assert_eq!(fixture.scan(&context), vec![main.clone()]);
++        assert_eq!(context.report().hits, 0);
++        assert_eq!(context.report().scans, 1);
++        context.finish();
++        drop(context);
++        let context = fixture.context(Mode::Reuse);
++        assert_eq!(fixture.scan(&context), vec![main]);
++        assert_eq!(context.report().hits, 1);
++    }
++
++    #[test]
++    fn retained_hits_and_fresh_updates_share_the_record_budget() {
++        let fixture = Fixture::new();
++        let main = fixture.write("main.c", "int value;\n");
++        let context = fixture.context(Mode::Record);
++        fixture.scan(&context);
++        let key = context.state.lock().unwrap().used.first().unwrap().clone();
++        context.finish();
++        drop(context);
++        let context = fixture.context(Mode::Reuse);
++        context.state.lock().unwrap().used =
++            (0..MAX_RECORDS).map(|i| format!("{i:064x}")).collect();
++        assert_eq!(fixture.scan(&context), vec![main.clone()]);
++        assert_eq!(context.report().hits, 0);
++        assert_eq!(context.report().scans, 1);
++        assert_eq!(context.report().bypasses["record-budget"], 1);
++        assert_eq!(context.report().recorded_actions, MAX_RECORDS);
++        drop(context);
++        let context = fixture.context(Mode::Reuse);
++        let mut keys = (0..MAX_RECORDS - 1)
++            .map(|i| format!("{i:064x}"))
++            .collect::<BTreeSet<_>>();
++        keys.insert(key);
++        context.state.lock().unwrap().used = keys;
++        assert_eq!(fixture.scan(&context), vec![main]);
++        assert_eq!(context.report().hits, 1);
++        assert_eq!(context.report().scans, 0);
++        assert_eq!(context.report().recorded_actions, MAX_RECORDS);
++    }
++
++    #[test]
++    fn concurrent_reuse_hits_share_a_complete_retained_record() {
++        let fixture = Fixture::new();
++        fixture.write("main.c", "#include \"value.h\"\n");
++        fixture.write("value.h", "int value;\n");
++        let context = fixture.context(Mode::Record);
++        let expected = fixture.scan(&context);
++        context.finish();
++        drop(context);
++        let context = fixture.context(Mode::Reuse);
++        std::thread::scope(|scope| {
++            for _ in 0..8 {
++                scope.spawn(|| assert_eq!(fixture.scan(&context), expected));
++            }
++        });
++        assert_eq!(context.report().hits, 8);
++        assert_eq!(context.report().scans, 0);
++        assert_eq!(context.report().recorded_actions, 1);
++        context.finish();
++        assert_eq!(context.report().publication, "published");
++    }
++
+     #[test]
+     fn disabled_or_unfinished_plans_do_not_publish_and_unsupported_inputs_bypass() {
+         let fixture = Fixture::new();
+@@ -757,6 +952,58 @@ mod tests {
+         assert_eq!(context.report().candidate_mismatches, 0);
+     }
+ 
++    #[test]
++    fn reuse_tracks_cross_header_query_aliases_and_opaque_uploads() {
++        let fixture = Fixture::new();
++        let main = fixture.write(
++            "main.c",
++            "#include \"defs/query.h\"\n#if PROBE(\"marker.h\")\n#endif\n",
++        );
++        let definitions = fixture.write(
++            "defs/query.h",
++            "#define ROOT __has_include\n#define PROBE ROOT\n",
++        );
++        let manifest = fixture.write("build.ninja", "command data with PROBE(x)\n");
++        let seeds = vec![main.clone(), manifest.clone()];
++        let check = |hit: bool, present: bool| {
++            let context = fixture.context(Mode::Reuse);
++            let paths = context
++                .discover_resolved(
++                    "cc -c main.c",
++                    seeds.clone(),
++                    &[],
++                    Some(Path::new(
++                        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-cc/bin/cc",
++                    )),
++                )
++                .unwrap();
++            let mut expected = HashSet::from([main.clone(), definitions.clone(), manifest.clone()]);
++            if present {
++                expected.insert(fixture.cwd().join("marker.h"));
++            }
++            assert_eq!(HashSet::from_iter(paths), expected);
++            assert_eq!(context.report().hits, u64::from(hit));
++            assert_eq!(context.report().scans, u64::from(!hit));
++            assert_eq!(context.report().recorded_actions, 1);
++            context.finish();
++        };
++        check(false, false);
++        fixture.write("build.ninja", "new opaque bytes\n");
++        check(true, false);
++        fixture.write("marker.h", "not c\n");
++        check(false, true);
++        fixture.write("marker.h", "different leaf bytes\n");
++        check(true, true);
++        let before = fs::metadata(&definitions).unwrap();
++        fixture.write("defs/query.h", "#define PROBE(x) 0\n");
++        fs::File::open(&definitions)
++            .unwrap()
++            .set_times(fs::FileTimes::new().set_modified(before.modified().unwrap()))
++            .unwrap();
++        check(false, false);
++        check(true, false);
++    }
++
+     #[test]
+     fn exhausted_capture_budget_keeps_fresh_results() {
+         let fixture = Fixture::new();

@@ -13,7 +13,7 @@ from build_oracle import mutate
 
 KINDS = ["implementation", "header", "preserved-mtime", "optional", "shadow", "search-order",
          "retarget", "generated", "generator", "invalid", "recovery", "graph", "command",
-         "irrelevant", "noop"]
+         "irrelevant", "noop", "query-alias"]
 
 
 def snapshot(state, name):
@@ -33,11 +33,18 @@ def snapshot(state, name):
         files["early/value.h"] = f'#define VALUE {state["shadow_value"]}\n'
     if state["bonus"]:
         files["bonus.h"] = f'#define BONUS {state["bonus"]}\n'
+        files["query.marker"] = 'not a c header\n'
     implementation = f'#include "{outer}"\n#include "alias.h"\n'
     implementation += '#if __has_include("bonus.h")\n#include "bonus.h"\n#else\n#define BONUS 0\n#endif\n'
+    probe = "__has_include" if state["query"] == 0 else "PROBE"
+    if state["query"] in {1, 2}:
+        implementation += '#include "query/defs.h"\n'
+        files["query/defs.h"] = ('#define PROBE __has_include\n' if state["query"] == 1
+                                  else '#define ROOT __has_include\n#define PROBE ROOT\n')
+    implementation += f'#if {probe}("query.marker")\n#define QUERY 7\n#else\n#define QUERY 0\n#endif\n'
     if state["generated"]:
         implementation += '#include "generated.h"\n'
-    expression = f'VALUE + ALIAS + BONUS + MODE + {state["offset"]}'
+    expression = f'VALUE + ALIAS + BONUS + QUERY + MODE + {state["offset"]}'
     if state["generated"]:
         expression += " + GENERATED"
     files["lib.c"] = implementation + "int value(void) { return " + expression
@@ -45,6 +52,8 @@ def snapshot(state, name):
     files["extra.c"] = f'int extra(void) {{ return {state["extra_value"]}; }}\n'
     includes = ["late", "early"] if state["reverse"] else ["early", "late"]
     flags = " ".join(f"-I../source/{name}" for name in includes)
+    if state["query"] == 3:
+        flags += " -DPROBE=__has_include"
     ninja = "rule cc\n  command = cc -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never "
     ninja += f'{flags} -I../source -I. -DMODE={state["mode"]} -MD -MF $out.d -o $out -c $in\n'
     ninja += "  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\n"
@@ -60,6 +69,7 @@ def snapshot(state, name):
     ninja += "build app: link main.o lib.o" + (" extra.o" if state["extra"] else "") + "\n"
     value = state["shadow_value"] if state["shadow"] and not state["reverse"] else state["value"]
     value += state["alias"] + int(state["retarget"]) + state["bonus"] + state["mode"] + state["offset"]
+    value += 7 if state["bonus"] else 0
     value += state["generator"] if state["generated"] else 0
     value += state["extra_value"] if state["extra"] else 0
     return {"name": name, "files": files, "symlink": {"alias.h": "two/alias.h" if state["retarget"] else "one/alias.h"},
@@ -108,7 +118,7 @@ def generate(seed, edits=16):
              "alias": rng.randrange(1, 8), "offset": 0, "mode": 0, "bonus": 0, "shadow": False,
              "shadow_value": rng.randrange(20, 30), "retarget": False, "reverse": False,
              "generated": False, "generator": rng.randrange(1, 8), "invalid": False,
-             "extra": False, "extra_value": rng.randrange(1, 8), "irrelevant": 0}
+             "extra": False, "extra_value": rng.randrange(1, 8), "irrelevant": 0, "query": 0}
     states = [snapshot(state, "baseline")]
     kinds = KINDS[:3]
     rng.shuffle(kinds)
@@ -134,6 +144,8 @@ def generate(seed, edits=16):
             state["mode"] += rng.randrange(1, 5)
         elif kind == "irrelevant":
             state["irrelevant"] += 1
+        elif kind == "query-alias":
+            state["query"] = (state["query"] + rng.randrange(1, 4)) % 4
         states.append(snapshot(state, f"{index:03d}-{kind}"))
     return states
 
@@ -177,7 +189,8 @@ def check_reference(value):
                       "stdout": result.stdout, "stderr": result.stderr}
             records.append(record)
             if edit["expected_exit"] is None:
-                if result.returncode == 0 or not re.search(r"lib\.c:\d+:\d+: (?:fatal )?error:", result.stdout + result.stderr):
+                pattern = re.escape(edit.get("diagnostic_file", "lib.c")) + r":\d+:\d+: (?:fatal )?error:"
+                if result.returncode == 0 or not re.search(pattern, result.stdout + result.stderr):
                     raise RuntimeError(f"expected compiler failure: {edit['name']}")
             else:
                 if result.returncode:

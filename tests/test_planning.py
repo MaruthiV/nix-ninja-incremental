@@ -60,6 +60,31 @@ class PlanningLeaseTests(unittest.TestCase):
         with self.view.lease():
             pass
 
+    def test_reuse_measurement_requires_real_warm_hit_counters(self):
+        report = self.measure({"reusing": "reuse"})
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["runs"][0]["discovery"]["hits"], 0)
+        self.assertEqual(report["runs"][1]["discovery"]["hits"], 1)
+        self.assertEqual(report["runs"][1]["discovery"]["scans"], 0)
+
+    def test_always_scanning_cannot_pass_as_warm_reuse(self):
+        self.configuration.write_text(json.dumps({"audit": {"hits": 0, "scans": 1}}))
+        with self.assertRaisesRegex(RuntimeError, "did not exercise persisted records"):
+            self.measure({"reusing": "reuse"})
+        self.assertFalse(json.loads((self.root / "report/result.json").read_text())["passed"])
+        with self.view.lease():
+            pass
+
+    def test_record_mode_cannot_report_hits(self):
+        self.configuration.write_text(json.dumps({"audit": {"hits": 1, "scans": 0}}))
+        with self.assertRaisesRegex(RuntimeError, "audit failed"):
+            self.measure({"recording": "record"})
+
+    def test_reuse_cannot_double_count_a_hit_and_a_scan(self):
+        self.configuration.write_text(json.dumps({"audit": {"hits": 1, "scans": 1}}))
+        with self.assertRaisesRegex(RuntimeError, "audit failed"):
+            self.measure({"reusing": "reuse"})
+
 
 if __name__ == "__main__":
     unittest.main()
