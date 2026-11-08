@@ -25,7 +25,25 @@ def patch_set(name):
 
 
 def output(source, arguments):
-    return subprocess.check_output(["git", "-C", str(source), *arguments], text=True).strip()
+    source = source.resolve()
+    command = ["git", "-c", f"safe.directory={source}", "-C", str(source)]
+    metadata = source / ".git"
+    if metadata.is_file() and source.is_relative_to(ROOT):
+        value = metadata.read_text().strip()
+        if not value.startswith("gitdir: ") or "\n" in value:
+            raise ValueError("invalid linked worktree metadata")
+        original = Path(value.removeprefix("gitdir: "))
+        if original.is_absolute() and not original.exists() and original.parts[-3:-1] == (".git", "worktrees"):
+            admin = dev.SOURCE / ".git/worktrees" / original.name
+            if not admin.is_dir():
+                raise ValueError("linked worktree metadata is unavailable at this mount")
+            expected = (*source.relative_to(ROOT).parts, ".git")
+            backlink = Path((admin / "gitdir").read_text().strip())
+            common = (admin / (admin / "commondir").read_text().strip()).resolve()
+            if backlink.parts[-len(expected):] != expected or common != (dev.SOURCE / ".git").resolve():
+                raise ValueError("linked worktree metadata belongs to another source")
+            command += [f"--git-dir={admin}", f"--work-tree={source}"]
+    return subprocess.check_output([*command, *arguments], text=True).strip()
 
 
 def verify_base(source):
