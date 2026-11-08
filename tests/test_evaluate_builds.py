@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import evaluate_builds
+import evaluation_summary
 from input_view import InputView
 
 
@@ -54,7 +55,9 @@ class BuildEvaluationTests(unittest.TestCase):
             stdout = "zstd roundtrip ok\n"
         (destination / f"{name}.stdout").write_text(stdout)
         (destination / f"{name}.stderr").write_text("")
-        return {"returncode": 0, "elapsed_ns": 1}
+        row = {"returncode": 0, "elapsed_ns": 1}
+        report.setdefault("processes", {})[name] = row
+        return row
 
     def process(self, argv, env, destination, name):
         mode = argv[argv.index("--discovery-mode") + 1]
@@ -137,6 +140,21 @@ class BuildEvaluationTests(unittest.TestCase):
         for current in [[self.created], [self.base, "/tmp/owned"], [self.base, "/nix/store/bad"]]:
             with self.subTest(current=current), self.assertRaises(RuntimeError):
                 evaluate_builds.collection_set([self.base], current)
+
+    def verify_report(self, cold):
+        report = self.evaluate(cold=cold)
+        report["workload"] = self.workload
+        kind = "cold" if cold else "warm"
+        rows = evaluation_summary.verified_rows(self.destination / "result.json", report, kind)
+        for pair in report["pairs"]:
+            modes = evaluation_summary.verified_pair(pair, rows, report, kind)
+            self.assertEqual(set(modes), {"off", "reuse"})
+
+    def test_saved_warm_reports_are_compatible_with_raw_summary_checks(self):
+        self.verify_report(False)
+
+    def test_saved_cold_reports_are_compatible_with_raw_summary_checks(self):
+        self.verify_report(True)
 
     def test_an_asymmetric_warm_store_is_rejected(self):
         def asymmetric(argv, env, destination, name):
