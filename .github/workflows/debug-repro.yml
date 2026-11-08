@@ -29,6 +29,11 @@ jobs:
           python3 tools/dev.py exec -- nix-shell --impure
           --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).nixWorkload.shell'
           --run 'python3 /workspace/tools/debug_repro.py --disposable-store daemon'
+      - name: Rebuild with retained traces after path-only collection
+        run: >-
+          python3 tools/dev.py exec -- nix-shell --impure
+          --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).nixWorkload.shell'
+          --run 'python3 /workspace/tests/debug_collection_checks.py --disposable-store daemon'
       - name: Raw reproduction records
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
