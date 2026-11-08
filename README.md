@@ -61,6 +61,16 @@ The final protocol is in [benchmarks/workloads.json](benchmarks/workloads.json):
 
 [campaign_summary.py](tools/campaign_summary.py) requires exact seed/mode/state coverage and checks raw source, artifact, plan and provenance records. [evaluation_summary.py](tools/evaluation_summary.py) requires exact paired coverage and validates raw audits/plans, input edits, functional probes and store states. It reports absolute times, median paired differences/ratios and fixed-seed bootstrap intervals, retaining failed/incomplete results. Child RSS excludes independent daemon workers; cgroup boundary/cumulative values are separately labelled context.
 
+[baseline_summary.py](tools/baseline_summary.py) independently checks contextual compatibility, raw plans/audits, binary labels and the exact seeded measurement order. It recomputes each matched baseline comparison separately for current-off and warm reuse, preserving failed or different-plan probes as exclusions. Analyze each calibration separately; duplicate workload reports are rejected.
+
+After downloading a contextual-baseline workflow's artifacts into `results/baseline-calibration`, verify them with the frozen release identity:
+
+```sh
+python3 tools/baseline_summary.py results/baseline-calibration \
+  --expected-binary-sha256 a9bdf2d1ba5d26a136e1b64602d9e0cc2b56232038e47ce006d3c30bc164052a \
+  --output results/baseline-summary.json
+```
+
 ## Evidence and scope
 
 The frozen reuse binary has passed [native artifact/lifecycle checks](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42431292377), a [bounded seeded campaign](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42431292422), [real workload audits](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42431292426), [full Nix functional validation](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42432062401), and [owned-store lifecycle checks](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42433696359). These provide bounded evidence for the stated contract. Whole Nix functional validation is distinct from independent whole-binary equivalence; the small fixtures compare fresh bytes directly.
