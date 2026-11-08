@@ -7,22 +7,30 @@ on:
       - environment/**
       - patches/**
       - tools/build_oracle.py
+      - tools/planning.py
+      - tools/realize.py
       - tools/input_view.py
       - tests/fixtures/build_edits.json
       - tests/fixtures/alias_build_edits.json
       - tests/fixtures/presence_build_edits.json
       - tests/recording_checks.py
+      - tests/lifecycle_checks.py
+      - tests/store_lifecycle_checks.py
       - .github/workflows/recording-state.yml
   pull_request:
     paths:
       - environment/**
       - patches/**
       - tools/build_oracle.py
+      - tools/planning.py
+      - tools/realize.py
       - tools/input_view.py
       - tests/fixtures/build_edits.json
       - tests/fixtures/alias_build_edits.json
       - tests/fixtures/presence_build_edits.json
       - tests/recording_checks.py
+      - tests/lifecycle_checks.py
+      - tests/store_lifecycle_checks.py
       - .github/workflows/recording-state.yml
 
 permissions:
@@ -56,6 +64,11 @@ jobs:
           python3 tools/dev.py exec -- nix-shell --impure
           --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).shell'
           --run 'python3 /workspace/tests/lifecycle_checks.py'
+      - name: Store collection and metadata bounds
+        run: >-
+          python3 tools/dev.py exec -- nix-shell --impure
+          --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).shell'
+          --run 'python3 /workspace/tests/store_lifecycle_checks.py --disposable-store daemon --iterations 64'
       - name: Recording records
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f

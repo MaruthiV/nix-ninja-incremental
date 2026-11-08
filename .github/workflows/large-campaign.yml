@@ -1,0 +1,49 @@
+name: large artifact campaign
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: large-edits-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        start-seed: [2027, 2091, 2155, 2219]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Pinned recording variant
+        run: python3 tools/variants.py prepare recording
+      - name: Isolated Nix daemon
+        run: python3 tools/dev.py up
+      - name: Pinned Nix runtime
+        run: python3 tools/dev.py runtime
+      - name: Environment manifest
+        run: python3 tools/dev.py info
+      - name: Larger seeded artifact comparisons
+        run: >-
+          python3 tools/dev.py exec -- nix-shell --impure
+          --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).shell'
+          --run 'python3 /workspace/tests/seeded_checks.py --start-seed ${{ matrix.start-seed }} --seeds 64 --edits 32 --reduce-failure'
+      - name: Campaign records
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: large-edits-${{ matrix.start-seed }}-${{ github.run_id }}
+          path: |
+            results/setup/
+            results/campaigns/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Stop project daemon
+        if: always()
+        run: python3 tools/dev.py stop
