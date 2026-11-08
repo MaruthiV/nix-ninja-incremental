@@ -34,8 +34,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-      - name: Pinned upstream and correction
-        run: python3 tools/variants.py prepare aliases
+      - name: Pinned reuse implementation
+        run: python3 tools/variants.py prepare recording
       - name: Isolated Nix daemon
         run: python3 tools/dev.py up
       - name: Pinned Nix runtime
@@ -45,8 +45,8 @@ jobs:
       - name: Complete Nix target and functional probes
         run: >-
           python3 tools/dev.py exec -- nix-shell --impure
-          --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-aliases; cliRuntime = true; }).nixWorkload.shell'
-          --run 'python3 /workspace/tools/realize.py --variant aliases'
+          --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).nixWorkload.shell'
+          --run 'python3 /workspace/tools/realize.py --variant recording --discovery-mode reuse'
       - name: Compatibility records
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f

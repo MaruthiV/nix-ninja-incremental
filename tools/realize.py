@@ -1,6 +1,6 @@
 import argparse
 import bz2
-from contextlib import closing
+from contextlib import closing, ExitStack
 import hashlib
 import json
 import os
@@ -11,6 +11,7 @@ import subprocess
 import time
 
 import workloads
+from planning import discovery_report
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -82,14 +83,38 @@ def snapshot_variant(variant, destination):
     return source, actual
 
 
-def realize(variant, destination):
+def invoke_planner(binary, view, target, env, destination, name, report, controller, mode=None, tool=None):
+    command = [str(binary), "-C", str(view.root / "build"), "-j4"]
+    if mode is not None:
+        command += ["--input-view", str(view.marker), "--discovery-mode", mode,
+                    "--discovery-cache", str(view.control / "discovery")]
+        controller.close()
+    if tool is not None:
+        command += ["-t", tool]
+    try:
+        result = invoke([*command, target], env, destination, name, report)
+    finally:
+        if mode is not None:
+            controller.enter_context(view.lease())
+    if mode is not None:
+        result["discovery"] = discovery_report((destination / f"{name}.stderr").read_text(), mode)
+    return result
+
+
+def plan_digest(destination, name):
+    value = json.loads((destination / f"{name}.stdout").read_text())
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def realize(variant, destination, discovery_mode=None):
     env = dict(os.environ)
     for key in ["NIX_BUILD_TOP", "NIX_NINJA_DRV", "NIX_NINJA_PROFILE"]:
         env.pop(key, None)
     record = {
         "schema_version": 1, "passed": False,
         "stage": "full-target functional compatibility; no reference equivalence or performance claim",
-        "variant": variant, "machine": platform.platform(),
+        "variant": variant, "discovery_mode": discovery_mode, "machine": platform.platform(),
     }
     since = time.time()
     try:
@@ -107,15 +132,40 @@ def realize(variant, destination):
         workload = next(value for value in workloads.WORKLOADS if value["name"] == "nix")
         view = workloads.capture(workload)
         record["input_view"] = view.data
-        with closing(view), view.lease():
+        with closing(view), ExitStack() as controller:
+            controller.enter_context(view.lease())
             view.validate_links()
             capture = (view.control / "capture.json").read_bytes()
             (destination / "capture.json").write_bytes(capture)
             shutil.copyfile(view.control / "configure.log", destination / "configure.log")
             build = view.root / "build"
-            record["build"] = invoke([
-                str(binary), "-C", str(build), "-j4", workload["target"],
-            ], env, destination, "build", record)
+
+            def planner(name, mode, tool=None):
+                return invoke_planner(binary, view, workload["target"], env, destination,
+                                      name, record, controller, mode, tool)
+
+            if discovery_mode is not None:
+                cold = planner("cold-plan", discovery_mode, "drv")
+                if cold["discovery"]["hits"]:
+                    raise RuntimeError("a cold full-target plan unexpectedly reused discovery")
+                if discovery_mode != "off" and not cold["discovery"]["recorded_actions"]:
+                    raise RuntimeError("full-target planning did not produce eligible records")
+                planner("fresh-plan", "off", "drv")
+                record["plan_sha256"] = plan_digest(destination, "cold-plan")
+                if plan_digest(destination, "fresh-plan") != record["plan_sha256"]:
+                    raise RuntimeError("persistent full-target planning changed the fresh derivation")
+            record["build"] = planner("build", discovery_mode)
+            if discovery_mode in {"record", "reuse"}:
+                counter = "hits" if discovery_mode == "reuse" else "validated_candidates"
+                if not record["build"]["discovery"][counter]:
+                    raise RuntimeError("full-target build did not exercise persisted discovery")
+                planner("warm-plan", discovery_mode, "drv")
+                if plan_digest(destination, "warm-plan") != record["plan_sha256"]:
+                    raise RuntimeError("warm full-target planning changed the derivation")
+                snapshot = destination / "discovery-state.json"
+                shutil.copyfile(view.control / "discovery/state.json", snapshot)
+                snapshot.chmod(0o644)
+                record["state_sha256"] = digest(snapshot)
             target = build / workload["target"]
             record.update(artifact=str(target.resolve(strict=True)), artifact_sha256=digest(target))
             checks = [
@@ -143,14 +193,17 @@ def realize(variant, destination):
 def main():
     parser = argparse.ArgumentParser(description="Pinned full Nix target compatibility check")
     parser.add_argument("--variant", default="aliases")
+    parser.add_argument("--discovery-mode", choices=["off", "record", "reuse"])
     args = parser.parse_args()
     series = json.loads((ROOT / "patches/series.json").read_text())
     if args.variant not in series["variant_postimages"]:
         parser.error("variant needs declared postimages")
+    if args.discovery_mode is not None and args.variant != "recording":
+        parser.error("discovery modes require the recording variant")
     destination = ROOT / "results/realization" / f"nix-{time.time_ns()}"
     destination.mkdir(parents=True)
     print(destination, flush=True)
-    realize(args.variant, destination)
+    realize(args.variant, destination, args.discovery_mode)
 
 
 if __name__ == "__main__":
