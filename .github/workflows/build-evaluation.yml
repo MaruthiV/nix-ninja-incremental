@@ -1,0 +1,62 @@
+name: paired build evaluation
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        type: choice
+        options: [warm, cold]
+        default: warm
+      cold_rounds:
+        type: choice
+        options: [pilot, remaining, all]
+        default: pilot
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-evaluation-${{ inputs.kind }}-${{ inputs.cold_rounds }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        workload: [nix, zstd]
+        round: ${{ fromJSON(inputs.kind == 'warm' && '[0]' || inputs.cold_rounds == 'pilot' && '[0]' || inputs.cold_rounds == 'remaining' && '[1,2,3,4,5,6,7,8,9]' || '[0,1,2,3,4,5,6,7,8,9]') }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Frozen implementation
+        run: python3 tools/variants.py prepare recording
+      - name: Isolated Nix daemon
+        run: python3 tools/dev.py up
+      - name: Pinned Nix runtime
+        run: python3 tools/dev.py runtime
+      - name: Environment manifest
+        run: python3 tools/dev.py info
+      - name: Paired end-to-end builds
+        run: >-
+          python3 tools/dev.py exec -- nix-shell --impure
+          --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).nixWorkload.shell'
+          --run 'python3 /workspace/tools/evaluate_builds.py ${{ matrix.workload }} --kind ${{ inputs.kind }}
+          --rounds ${{ inputs.kind == 'warm' && '10' || '1' }} --first-round ${{ matrix.round }} --seed 2027
+          --disposable-store daemon --expected-binary-sha256 a9bdf2d1ba5d26a136e1b64602d9e0cc2b56232038e47ce006d3c30bc164052a'
+      - name: Evaluation records
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: build-evaluation-${{ inputs.kind }}-${{ matrix.workload }}-${{ matrix.round }}-${{ github.run_id }}
+          path: |
+            results/setup/
+            results/workloads/
+            results/evaluation/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Stop project daemon
+        if: always()
+        run: python3 tools/dev.py stop

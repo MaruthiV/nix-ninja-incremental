@@ -174,8 +174,9 @@ def paired_plans(binary, workload, view, destination, report, rounds, seed):
             edits.reset()
 
 
-def evaluate(workload, destination, rounds, seed, expected_binary=None):
-    report = {"schema_version": 1, "stage": "frozen paired planning evaluation", "passed": False,
+def evaluate(workload, destination, rounds, seed, expected_binary=None, driver=paired_plans,
+             stage="frozen paired planning evaluation"):
+    report = {"schema_version": 1, "stage": stage, "passed": False,
               "workload": workload, "rounds": rounds, "seed": seed,
               "harness_sha256": realize.digest(Path(__file__)), "memory_scope": "CLI/waited-child max RSS; cgroup values are boundary/cumulative context"}
     try:
@@ -212,7 +213,7 @@ def evaluate(workload, destination, rounds, seed, expected_binary=None):
             report["input_view"] = view.data
             for name in ["capture.json", "configure.log"]:
                 shutil.copyfile(view.control / name, destination / name)
-            paired_plans(binary, workload, view, destination, report, rounds, seed)
+            driver(binary, workload, view, destination, report, rounds, seed)
         report["passed"] = True
     except Exception as error:
         report["error"] = str(error)
