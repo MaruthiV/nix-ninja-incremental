@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import build_oracle
+import campaign_summary
 import edit_traces
 from recording_checks import compare
 
@@ -104,6 +105,9 @@ def main():
         raise
     finally:
         (destination / "result.json").write_text(json.dumps(record, indent=2) + "\n")
+    verified = campaign_summary.summarize([destination], destination / "verified.json",
+                                          args.start_seed, args.seeds, args.edits, record["binary_sha256"])
+    print(f"verified {len(verified['verified'])} seeds and {verified['totals']['states']} artifact states", flush=True)
 
 
 if __name__ == "__main__":
