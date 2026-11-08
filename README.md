@@ -69,7 +69,7 @@ The workflows use pinned actions, source revisions, tools and container/runtime 
 | [paired builds](.github/workflows/build-evaluation.yml) | Store-warm end-to-end pairs and separately sharded cold/full pairs |
 | [contextual baselines](.github/workflows/baseline-evaluation.yml) | Unmodified/corrected compatibility and paired no-op overhead |
 | [planner API counts](.github/workflows/operation-counts.yml) | Matched frozen/instrumented plans and diagnostic operation counts |
-| [cold debug reproduction](.github/workflows/debug-repro.yml) | Legacy debug-path mismatch and mapped byte equality with debug information retained |
+| [cold debug reproduction](.github/workflows/debug-repro.yml) | Legacy/mapped debug bytes and recovery after collection with traces and metadata retained |
 
 The final protocol is in [benchmarks/workloads.json](benchmarks/workloads.json): pinned Nix and Zstd, no-op/irrelevant/implementation/shared-header edits and cold builds, seed 2027. Real-workload content probes are nonsemantic; deterministic fixtures separately test semantic invalidation. Planning and realization are measured separately. Setup, metadata warming, resets, publication and cleanup remain visible; compiler-result caching is disabled and OS page caches are uncontrolled.
 
@@ -95,6 +95,16 @@ python3 tools/operation_summary.py results/operation-counts \
 ```
 
 Cold trials using the debug-prefix helper select `debug_paths=mapped` in the build workflow and `--cold-control mapped-debug-paths-v1` during analysis. Legacy and mapped data are separate epochs. The tiny debug reproduction and both [full mapped cold pilot pairs](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42457149027) pass. The Nix pair has identical saved executable/object bytes and matching complete store-content maps. One pair per workload is pilot evidence; repeated cold evaluation remains in progress.
+
+For debug-path mapping, put the opt-in [task helper](benchmarks/cold-debug/control.nix) ahead of the legacy helper on the controller's task `PATH`. It preserves debug information. After the pinned container/runtime setup, reproduce the [native collection recovery check](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42463766517):
+
+```sh
+python3 tools/dev.py exec -- nix-shell --impure \
+  --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).nixWorkload.shell' \
+  --run 'python3 /workspace/tests/debug_collection_checks.py --disposable-store daemon'
+```
+
+The runner selects that helper explicitly, builds a tiny `-g` target, collects its fixture paths in the disposable project store while retaining discovery metadata and CA traces, and rebuilds. It requires a real reuse hit, identical object/executable bytes and store paths, matching plans/probes and exact final store restoration. This is a bounded recovery check, separate from performance measurements.
 
 ## Evidence and scope
 
