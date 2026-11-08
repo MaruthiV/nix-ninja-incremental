@@ -2,7 +2,7 @@
 
 Validated persistent dependency discovery for [PDT Partners' nix-ninja](https://github.com/pdtpartners/nix-ninja), with independent artifact tests and reproducible planning/build measurements. This is an independent extension against a pinned upstream revision.
 
-The frozen reuse implementation has passed native artifact/recovery checks, the full 256-seed edit campaign, real-workload audits and full Nix functional checks. Repeated planning and store-warm evaluation are complete; corrected cold-build evaluation is in progress. Broad-header regressions remain visible in the study.
+The frozen reuse implementation has passed native artifact/recovery checks, the full 256-seed edit campaign, real-workload audits and full Nix functional checks. Repeated planning and store-warm evaluation are complete. Mapped cold pilot pairs pass artifact, plan and store-reset checks; the repeated cold study is in progress. Broad-header regressions remain visible in the study.
 
 ## What it does
 
@@ -94,7 +94,7 @@ python3 tools/operation_summary.py results/operation-counts \
   --output results/setup/verified-operations.json
 ```
 
-Cold trials using the debug-prefix helper select `debug_paths=mapped` in the build workflow and `--cold-control mapped-debug-paths-v1` during analysis. Legacy and mapped data are separate epochs. The tiny debug reproduction passes; full mapped cold pilots remain in progress.
+Cold trials using the debug-prefix helper select `debug_paths=mapped` in the build workflow and `--cold-control mapped-debug-paths-v1` during analysis. Legacy and mapped data are separate epochs. The tiny debug reproduction and both [full mapped cold pilot pairs](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42457149027) pass. The Nix pair has identical saved executable/object bytes and matching complete store-content maps. One pair per workload is pilot evidence; repeated cold evaluation remains in progress.
 
 ## Evidence and scope
 
