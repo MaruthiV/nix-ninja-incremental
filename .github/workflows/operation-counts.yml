@@ -38,7 +38,7 @@ jobs:
       - name: Raw count verification
         run: >-
           python3 tools/operation_summary.py results/evaluation --workload ${{ matrix.workload }}
-          --output results/evaluation/verified-operations.json
+          --output results/setup/verified-operations.json
       - name: Raw operation-count records
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f

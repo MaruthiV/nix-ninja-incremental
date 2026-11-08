@@ -68,6 +68,8 @@ The workflows use pinned actions, source revisions, tools and container/runtime 
 | [paired planning](.github/workflows/planning-evaluation.yml) | Ten first-post-edit pairs per declared planning scenario and workload |
 | [paired builds](.github/workflows/build-evaluation.yml) | Store-warm end-to-end pairs and separately sharded cold/full pairs |
 | [contextual baselines](.github/workflows/baseline-evaluation.yml) | Unmodified/corrected compatibility and paired no-op overhead |
+| [planner API counts](.github/workflows/operation-counts.yml) | Matched frozen/instrumented plans and diagnostic operation counts |
+| [cold debug reproduction](.github/workflows/debug-repro.yml) | Legacy debug-path mismatch and mapped byte equality with debug information retained |
 
 The final protocol is in [benchmarks/workloads.json](benchmarks/workloads.json): pinned Nix and Zstd, no-op/irrelevant/implementation/shared-header edits and cold builds, seed 2027. Real-workload content probes are nonsemantic; deterministic fixtures separately test semantic invalidation. Planning and realization are measured separately. Setup, metadata warming, resets, publication and cleanup remain visible; compiler-result caching is disabled and OS page caches are uncontrolled.
 
@@ -82,6 +84,17 @@ python3 tools/baseline_summary.py results/baseline-calibration \
   --expected-binary-sha256 a9bdf2d1ba5d26a136e1b64602d9e0cc2b56232038e47ce006d3c30bc164052a \
   --output results/baseline-summary.json
 ```
+
+The API-count diagnostic keeps the frozen helper/tool paths while invoking a separately instrumented binary. It verifies matching source edits, discovery audits and raw plans before interpreting profiles. Counts are planner API attempts, including failures, rather than unique objects or daemon work. Worker durations overlap; diagnostic elapsed times stay separate from the frozen performance samples.
+
+After downloading both operation-count artifacts into `results/operation-counts`, verify all eight workload/scenario comparisons:
+
+```sh
+python3 tools/operation_summary.py results/operation-counts \
+  --output results/setup/verified-operations.json
+```
+
+Cold trials using the debug-prefix helper select `debug_paths=mapped` in the build workflow and `--cold-control mapped-debug-paths-v1` during analysis. Legacy and mapped data are separate epochs. The tiny debug reproduction passes; full mapped cold pilots remain in progress.
 
 ## Evidence and scope
 
