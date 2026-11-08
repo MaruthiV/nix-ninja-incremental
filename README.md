@@ -2,7 +2,24 @@
 
 Validated persistent dependency discovery for [PDT Partners' nix-ninja](https://github.com/pdtpartners/nix-ninja), with independent artifact tests and reproducible planning/build measurements. This is an independent extension against a pinned upstream revision.
 
-The frozen reuse implementation has passed native artifact/recovery checks, the full 256-seed edit campaign, real-workload audits and full Nix functional checks. Repeated planning and store-warm evaluation are complete. Mapped cold pilot pairs pass artifact, plan and store-reset checks; the repeated cold study is in progress. Broad-header regressions remain visible in the study.
+The frozen reuse implementation has passed native artifact/recovery checks, the full 256-seed edit campaign, real-workload audits and full Nix functional checks. Planning, store-warm and mapped cold evaluation are complete: 180 pairs / 360 timed calls. Six of eight predeclared performance targets pass; both store-warm shared-header targets fail. The results support opt-in use within the contract below.
+
+## Measured results
+
+Each primary case has ten native off/reuse pairs. Positive improvement means reuse is faster; effects are medians of per-pair `1 - reuse/off`, with fixed-seed paired-bootstrap 95% intervals.
+
+| Scenario | Nix improvement [95% interval] | Zstd improvement [95% interval] |
+| --- | ---: | ---: |
+| No-op planning | +23.23% [+21.74, +23.75] | +31.05% [+29.55, +35.87] |
+| Implementation-edit planning | +22.98% [+21.99, +23.93] | +21.13% [+19.59, +27.75] |
+| Shared-header store-warm build | -58.37% [-58.95, -56.34] | -43.79% [-46.02, -39.34] |
+| Cold build | -0.406% [-1.556, +0.404] | -0.084% [-0.633, +0.317] |
+
+The four no-op/implementation planning targets exceed 20% at the median; both cold cases meet the 5% median-regression limit. Both shared-header cases miss that limit. Cold intervals include zero, so no cold speedup is demonstrated. Store-warm builds prewarm the declared state union; they do not measure first recompilation.
+
+A separate [matched three-way Zstd no-op control](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42444066454) finds a modest **7.13% net planning benefit [2.71%, 10.57%]** over the simpler corrected baseline, including the feature's overhead. Nix contextual plans differ, so no equivalent-work net Nix gain is claimed. These results do not justify default enablement or universal acceleration.
+
+Raw evidence and machine manifests are retained in the [planning](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42437597957), [store-warm](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42438070314), [cold pilot](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42457149027) and [remaining cold](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42463748456) workflow artifacts, subject to GitHub retention. Download the successful Nix 5 retry artifact by ID when both attempts share a name. The original dependency-download failure is preserved; no successful measured pair was rerun.
 
 ## What it does
 
@@ -94,7 +111,18 @@ python3 tools/operation_summary.py results/operation-counts \
   --output results/setup/verified-operations.json
 ```
 
-Cold trials using the debug-prefix helper select `debug_paths=mapped` in the build workflow and `--cold-control mapped-debug-paths-v1` during analysis. Legacy and mapped data are separate epochs. The tiny debug reproduction and both [full mapped cold pilot pairs](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42457149027) pass. The Nix pair has identical saved executable/object bytes and matching complete store-content maps. One pair per workload is pilot evidence; repeated cold evaluation remains in progress.
+Cold trials using the debug-prefix helper select `debug_paths=mapped` in the build workflow and `--cold-control mapped-debug-paths-v1` during analysis. Legacy and mapped data are separate epochs. All twenty mapped pairs pass strict saved artifact/object bytes, plans/probes, distinct native preflights and exact store resets; complete within-pair NAR hash/size/reference and CA trace maps also match. No stripping or hash normalization is used. The original failed setup and successful same-commit Nix 5 retry remain separate retained records.
+
+Extract successful pilot and remaining-pair artifacts into one directory with distinct subdirectories. Include only successful mapped reports: ten per workload, indices 0–9. Verify their complete primary coverage with:
+
+```sh
+python3 tools/evaluation_summary.py results/cold-mapped \
+  --kind cold --rounds 10 --cold-control mapped-debug-paths-v1 \
+  --expected-binary-sha256 a9bdf2d1ba5d26a136e1b64602d9e0cc2b56232038e47ce006d3c30bc164052a \
+  --output results/cold-summary.json
+```
+
+The cold study keeps compiler flags/debug information, requires zero initial discovery hits, and restores protected paths and CA trace maps between modes. Source capture, preparation, resets, verification copies and post-build plans remain separate from timed CLI calls. The measured call includes validation, observation recording and metadata publication. CLI/waited-child RSS excludes independent daemon workers; no complete controller-wall-time or total-memory claim is made.
 
 For debug-path mapping, put the opt-in [task helper](benchmarks/cold-debug/control.nix) ahead of the legacy helper on the controller's task `PATH`. It preserves debug information. After the pinned container/runtime setup, reproduce the [native collection recovery check](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42463766517):
 
