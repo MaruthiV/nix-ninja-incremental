@@ -13,6 +13,7 @@ on:
       - tests/fixtures/build_edits.json
       - tests/fixtures/alias_build_edits.json
       - tests/fixtures/presence_build_edits.json
+      - tests/fixtures/graph_build_edits.json
       - tests/recording_checks.py
       - tests/lifecycle_checks.py
       - tests/store_lifecycle_checks.py
@@ -28,6 +29,7 @@ on:
       - tests/fixtures/build_edits.json
       - tests/fixtures/alias_build_edits.json
       - tests/fixtures/presence_build_edits.json
+      - tests/fixtures/graph_build_edits.json
       - tests/recording_checks.py
       - tests/lifecycle_checks.py
       - tests/store_lifecycle_checks.py

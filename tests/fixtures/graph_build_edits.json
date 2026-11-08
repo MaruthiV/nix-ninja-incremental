@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "name": "generated-and-graph-transitions",
+  "target": "app",
+  "outputs": [
+    "main.o",
+    "lib.o",
+    "renamed.o",
+    "stable.o",
+    "app",
+    "main.o.d",
+    "lib.o.d",
+    "renamed.o.d",
+    "stable.o.d",
+    "generated.h",
+    "second.h",
+    "marker.txt"
+  ],
+  "files": {
+    "main.c": "int value(void);\nint main(void) { return value(); }\n",
+    "stable.c": "int stable(void) { return 0; }\n",
+    "lib.c": "#include \"generated.h\"\nint value(void) { return GENERATED + VALUE_BIAS; }\n",
+    "generated.in": "#define GENERATED 4\n",
+    "sentinel.txt": "first implicit input\n",
+    "order.in": "first order-only input\n"
+  },
+  "build_ninja": "rule cc\n  command = cc -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -DVALUE_BIAS=0 -I. -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nrule generate\n  command = cat $in > $out\nrule marker\n  command = cp $in $out\nbuild generated.h: generate ../source/generated.in\nbuild main.o: cc ../source/main.c\nbuild stable.o: cc ../source/stable.c\nbuild lib.o: cc ../source/lib.c || generated.h\nbuild app: link main.o lib.o stable.o\n",
+  "edits": [
+    {
+      "name": "baseline-generated-graph",
+      "expected_exit": 4
+    },
+    {
+      "name": "generator-input-change",
+      "write": {
+        "generated.in": "#define GENERATED 6\n"
+      },
+      "preserve_mtime": [
+        "generated.in"
+      ],
+      "expected_exit": 6,
+      "stale_probe": true
+    },
+    {
+      "name": "generator-command-change",
+      "build_ninja": "rule cc\n  command = cc -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -DVALUE_BIAS=0 -I. -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nrule generate\n  command = sed 's/6/9/' $in > $out\nrule marker\n  command = cp $in $out\nbuild generated.h: generate ../source/generated.in\nbuild main.o: cc ../source/main.c\nbuild stable.o: cc ../source/stable.c\nbuild lib.o: cc ../source/lib.c || generated.h\nbuild app: link main.o lib.o stable.o\n",
+      "expected_exit": 9,
+      "stale_probe": true
+    },
+    {
+      "name": "new-generated-output",
+      "write": {
+        "lib.c": "#include \"second.h\"\nint value(void) { return GENERATED + VALUE_BIAS; }\n"
+      },
+      "build_ninja": "rule cc\n  command = cc -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -DVALUE_BIAS=0 -I. -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nrule generate\n  command = sed 's/6/9/' $in > $out\nrule marker\n  command = cp $in $out\nbuild second.h: generate ../source/generated.in\nbuild main.o: cc ../source/main.c\nbuild stable.o: cc ../source/stable.c\nbuild lib.o: cc ../source/lib.c || second.h\nbuild app: link main.o lib.o stable.o\n",
+      "expected_exit": 9,
+      "unchanged_artifact": true
+    },
+    {
+      "name": "implicit-edge-change",
+      "build_ninja": "rule cc\n  command = cc -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -DVALUE_BIAS=0 -I. -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nrule generate\n  command = sed 's/6/9/' $in > $out\nrule marker\n  command = cp $in $out\nbuild second.h: generate ../source/generated.in\nbuild main.o: cc ../source/main.c | ../source/sentinel.txt\nbuild stable.o: cc ../source/stable.c\nbuild lib.o: cc ../source/lib.c || second.h\nbuild app: link main.o lib.o stable.o\n",
+      "expected_exit": 9,
+      "unchanged_artifact": true
+    },
+    {
+      "name": "implicit-input-change",
+      "write": {
+        "sentinel.txt": "second implicit input\n"
+      },
+      "preserve_mtime": [
+        "sentinel.txt"
+      ],
+      "expected_exit": 9,
+      "unchanged_artifact": true
+    },
+    {
+      "name": "order-only-edge-change",
+      "build_ninja": "rule cc\n  command = cc -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -DVALUE_BIAS=0 -I. -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nrule generate\n  command = sed 's/6/9/' $in > $out\nrule marker\n  command = cp $in $out\nbuild second.h: generate ../source/generated.in\nbuild marker.txt: marker ../source/order.in\nbuild main.o: cc ../source/main.c | ../source/sentinel.txt || marker.txt\nbuild stable.o: cc ../source/stable.c\nbuild lib.o: cc ../source/lib.c || second.h\nbuild app: link main.o lib.o stable.o\n",
+      "expected_exit": 9,
+      "unchanged_artifact": true
+    },
+    {
+      "name": "order-only-producer-change",
+      "write": {
+        "order.in": "second order-only input\n"
+      },
+      "preserve_mtime": [
+        "order.in"
+      ],
+      "expected_exit": 9,
+      "unchanged_artifact": true
+    },
+    {
+      "name": "renamed-object-output",
+      "build_ninja": "rule cc\n  command = cc -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -DVALUE_BIAS=0 -I. -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nrule generate\n  command = sed 's/6/9/' $in > $out\nrule marker\n  command = cp $in $out\nbuild second.h: generate ../source/generated.in\nbuild marker.txt: marker ../source/order.in\nbuild main.o: cc ../source/main.c | ../source/sentinel.txt || marker.txt\nbuild stable.o: cc ../source/stable.c\nbuild renamed.o: cc ../source/lib.c || second.h\nbuild app: link main.o renamed.o stable.o\n",
+      "expected_exit": 9,
+      "unchanged_artifact": true
+    },
+    {
+      "name": "manifest-compile-command-change",
+      "build_ninja": "rule cc\n  command = cc -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -DVALUE_BIAS=1 -I. -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nrule generate\n  command = sed 's/6/9/' $in > $out\nrule marker\n  command = cp $in $out\nbuild second.h: generate ../source/generated.in\nbuild marker.txt: marker ../source/order.in\nbuild main.o: cc ../source/main.c | ../source/sentinel.txt || marker.txt\nbuild stable.o: cc ../source/stable.c\nbuild renamed.o: cc ../source/lib.c || second.h\nbuild app: link main.o renamed.o stable.o\n",
+      "expected_exit": 10,
+      "stale_probe": true
+    }
+  ]
+}
