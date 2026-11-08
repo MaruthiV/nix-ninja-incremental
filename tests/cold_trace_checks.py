@@ -13,7 +13,17 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from build_oracle import invoke, digest
 from evaluate_builds import collection_set, require_disposable_store
-from store_state import build_traces, trace_deletion_set
+from store_state import build_traces, trace_deletion_set, store_path
+
+
+def nix_program(program):
+    path = Path(program)
+    root = Path(*path.parts[:4])
+    store_path(str(root))
+    relative = path.relative_to(root)
+    if not relative.parts or ".." in relative.parts:
+        raise RuntimeError("probe program must stay below its store package")
+    return "(builtins.storePath " + json.dumps(str(root)) + ") + " + json.dumps("/" + str(relative))
 
 
 def check(destination):
@@ -62,7 +72,7 @@ def check(destination):
             raise RuntimeError("the probe requires pinned store-backed shell/coreutils")
         shell = '"${od}" -An -N16 -tx1 /dev/urandom > "$out"'
         expression = (
-            "let bash = builtins.storePath " + json.dumps(bash) + "; od = builtins.storePath " + json.dumps(od)
+            "let bash = " + nix_program(bash) + "; od = " + nix_program(od)
             + '; in builtins.derivation { name = "nni-trace-probe-' + secrets.token_hex(16)
             + '"; system = "x86_64-linux"; builder = bash; args = [ "-c" ' + json.dumps(shell) + ' ]; '
             + '__contentAddressed = true; outputHashAlgo = "sha256"; outputHashMode = "recursive"; }'
