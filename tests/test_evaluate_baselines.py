@@ -57,12 +57,14 @@ class BaselineComparisonTests(unittest.TestCase):
     def test_overhead_has_explicit_baseline_and_current_labels(self):
         result = evaluate_baselines.comparison_statistics([(100, 120)] * 10)
         self.assertAlmostEqual(result["median_current_overhead"], 0.2)
+        self.assertEqual(result["current_mode"], "off")
         self.assertEqual(result["median_current_extra_ns"], 20)
         self.assertEqual(result["median_baseline_ns"], 100)
         self.assertEqual(result["median_current_ns"], 120)
         self.assertAlmostEqual(result["overhead_bootstrap_95_interval"][0], 0.2)
-        result = evaluate_baselines.comparison_statistics([(100, 80)] * 10)
+        result = evaluate_baselines.comparison_statistics([(100, 80)] * 10, current_mode="reuse")
         self.assertAlmostEqual(result["median_current_overhead"], -0.2)
+        self.assertEqual(result["current_mode"], "reuse")
 
 
 if __name__ == "__main__":

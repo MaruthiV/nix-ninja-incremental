@@ -25,10 +25,10 @@ def verify_upstream(source, expected_revision):
     return revision
 
 
-def comparison_statistics(pairs):
+def comparison_statistics(pairs, current_mode="off"):
     result = paired_statistics(pairs)
     interval = result["paired_bootstrap_95_interval"]
-    return {"pairs": result["pairs"], "median_baseline_ns": result["median_off_ns"],
+    return {"pairs": result["pairs"], "current_mode": current_mode, "median_baseline_ns": result["median_off_ns"],
             "median_current_ns": result["median_reuse_ns"],
             "median_current_extra_ns": -result["median_paired_saved_ns"],
             "median_current_overhead": -result["median_paired_improvement"],
@@ -106,22 +106,31 @@ def baseline_plans(binary, workload, view, destination, report, rounds, seed):
             if row["comparable"]:
                 active[name] = executable
     if len(active) == 1:
-        report["comparison_status"] = "both contextual baselines incompatible; failures retained; no timing ratio"
+        report["comparison_status"] = "no contextual baseline has matching derivations; raw probes retained, no equivalent-plan timing ratio"
         return
+    baseline_names = [name for name in active if name != "current"]
+    active["reuse"] = binary
     measurement = planning.measure(SimpleNamespace(view=view.marker, output=destination / "planning",
-        binary=[f"{name}={path}" for name, path in active.items()], profile=[], discovery=["current=off"],
+        binary=[f"{name}={path}" for name, path in active.items()], profile=[], discovery=["current=off", "reuse=reuse"],
         jobs=4, repetitions=rounds, seed=seed))
     report["measurement"] = measurement
+    initial = next(row["discovery"] for row in measurement["runs"] if row["mode"] == "reuse" and row["warmup"])
+    if not initial["recorded_actions"] or any(
+        row["discovery"]["hits"] != initial["recorded_actions"]
+        for row in measurement["runs"] if row["mode"] == "reuse" and not row["warmup"]
+    ):
+        raise RuntimeError("contextual warm reuse did not hit every eligible prewarmed action")
     report["comparisons"] = {}
-    for name in active:
-        if name == "current":
-            continue
-        pairs = []
+    report["reuse_comparisons"] = {}
+    for name in baseline_names:
+        pairs, reuse_pairs = [], []
         for index in range(rounds):
             runs = {row["mode"]: row for row in measurement["runs"] if not row["warmup"] and row["round"] == index}
             pairs.append((runs[name]["elapsed_ns"], runs["current"]["elapsed_ns"]))
+            reuse_pairs.append((runs[name]["elapsed_ns"], runs["reuse"]["elapsed_ns"]))
         report["comparisons"][name] = comparison_statistics(pairs)
-    report["comparison_status"] = "paired equivalent-plan no-op overhead; not a cache speedup"
+        report["reuse_comparisons"][name] = comparison_statistics(reuse_pairs, current_mode="reuse")
+    report["comparison_status"] = "paired equivalent-plan no-op corrected/off/reuse calibration"
 
 
 def main():
