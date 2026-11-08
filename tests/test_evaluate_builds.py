@@ -244,6 +244,40 @@ class BuildEvaluationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "retained cold object bytes differ"):
             evaluation_summary.verified_rows(self.destination / "result.json", report, "cold")
 
+    def test_paired_objects_cannot_disagree_behind_equal_root_bytes_and_valid_archives(self):
+        original = self.evaluate(cold=True)
+        original["workload"] = self.workload
+
+        def save_object(row, value=b"actual object", identity="b"):
+            output = "/nix/store/" + identity * 32 + "-ninja-build-installable-derived-path.cc.o"
+            file = row["name"] + "-object-probe-" + identity * 32 + ".artifact.gz"
+            with gzip.open(self.destination / file, "wb") as artifact:
+                artifact.write(value)
+            row["object_probes"] = [{"store_output": output, "path": output, "saved_artifact": file,
+                                     "sha256": hashlib.sha256(value).hexdigest()}]
+
+        for change in ["none", "bytes", "identity", "missing"]:
+            report = copy.deepcopy(original)
+            for row in report["runs"]:
+                if row["kind"] == "measured":
+                    save_object(row)
+            pair = report["pairs"][0]
+            reused = next(row for row in report["runs"] if row["name"] in pair["measured"] and row["mode"] == "reuse")
+            if change == "bytes":
+                save_object(reused, b"different object")
+            elif change == "identity":
+                save_object(reused, identity="c")
+            elif change == "missing":
+                reused["object_probes"] = []
+            rows = evaluation_summary.verified_rows(self.destination / "result.json", report, "cold")
+            self.assertEqual(len({rows[name]["artifact_sha256"] for name in pair["measured"]}), 1)
+            with self.subTest(change=change):
+                if change == "none":
+                    evaluation_summary.verified_pair(pair, rows, report, "cold")
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "paired cold object observations differ"):
+                        evaluation_summary.verified_pair(pair, rows, report, "cold")
+
     def test_matching_path_inventories_cannot_hide_a_stale_build_trace(self):
         report = self.evaluate(cold=True)
         reset = next(reset for reset in report["store_resets"] if reset["trace_keys"])

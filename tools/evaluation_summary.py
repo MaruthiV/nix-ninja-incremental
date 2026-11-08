@@ -119,6 +119,10 @@ def verified_pair(pair, rows, data, kind):
     require(modes["off"][plan_key] == modes["reuse"][plan_key], "paired derivations differ")
     if kind != "planning":
         require(modes["off"]["artifact_sha256"] == modes["reuse"]["artifact_sha256"], "paired artifact observations differ")
+    if kind == "cold":
+        objects = {mode: {(probe["store_output"], probe["path"], probe["sha256"])
+                          for probe in modes[mode].get("object_probes", [])} for mode in ["off", "reuse"]}
+        require(objects["off"] == objects["reuse"], "paired cold object observations differ")
     original = data["original_source"]
     probes = data["workload"]["content_probes"]
     changed = {name for name in original if original[name] != modes["off"]["input_state"].get(name)}
