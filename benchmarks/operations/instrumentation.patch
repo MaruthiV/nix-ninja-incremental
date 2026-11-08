@@ -1,0 +1,316 @@
+diff --git a/crates/nix-ninja/src/build.rs b/crates/nix-ninja/src/build.rs
+--- a/crates/nix-ninja/src/build.rs
++++ b/crates/nix-ninja/src/build.rs
+@@ -25,7 +25,11 @@
+     config: BuildConfig,
+     rpc_client: &Arc<BuilderRpcClient>,
+ ) -> Result<DerivedFile> {
+-    let mut loader = load_file(build_filename)?;
++    let _span = crate::profile::span("planning.total");
++    let mut loader = {
++        let _span = crate::profile::span("planning.parse");
++        load_file(build_filename)?
++    };
+ 
+     let tools = task::Tools::new(&config.store_dir)?;
+ 
+@@ -40,7 +44,10 @@
+             discovery_options: config.discovery_options,
+         },
+     )?;
+-    runner.read_build_dir(&mut loader.graph.files)?;
++    {
++        let _span = crate::profile::span("planning.build_directory");
++        runner.read_build_dir(&mut loader.graph.files)?;
++    }
+ 
+     let mut scheduler = Scheduler::new(&mut loader.graph, &mut runner, config.jobs);
+ 
+@@ -53,7 +60,10 @@
+         .lookup(name)
+         .ok_or_else(|| anyhow!("unknown path requested: {}", name))?;
+     let _ = scheduler.want_file(fid);
+-    scheduler.run()?;
++    {
++        let _span = crate::profile::span("planning.schedule");
++        scheduler.run()?;
++    }
+ 
+     // println!("Successfully generated all derivations");
+ 
+diff --git a/crates/nix-ninja/src/cli.rs b/crates/nix-ninja/src/cli.rs
+--- a/crates/nix-ninja/src/cli.rs
++++ b/crates/nix-ninja/src/cli.rs
+@@ -99,6 +99,13 @@
+     }
+     let build_dir = std::env::current_dir().context("current_dir")?;
+     let discovery_options = discovery_options(&cli, &build_dir)?;
++    let _report = crate::profile::report(
++        &build_dir,
++        discovery_options
++            .as_ref()
++            .map(|options| options.lease.root.as_path()),
++        cli.is_output_derivation,
++    )?;
+ 
+     // Handle subtool if specified
+     if let Some(tool) = cli.tool.clone() {
+@@ -117,6 +124,7 @@
+     if cli.is_output_derivation {
+         submit_outer_output(&cli.store_dir, &derived_file, &rpc_client)?;
+     } else {
++        let _span = crate::profile::span("realization.final_output");
+         local::symlink_derived_files(&rpc_client, &cli.store_dir, &build_dir, &[derived_file])?;
+     }
+     Ok(())
+diff --git a/crates/nix-ninja/src/lib.rs b/crates/nix-ninja/src/lib.rs
+--- a/crates/nix-ninja/src/lib.rs
++++ b/crates/nix-ninja/src/lib.rs
+@@ -7,6 +7,7 @@
+ mod discovery_state;
+ mod input_view;
+ mod local;
++mod profile;
+ mod relative_from;
+ mod subtool;
+ mod task;
+diff --git a/crates/nix-ninja/src/local.rs b/crates/nix-ninja/src/local.rs
+--- a/crates/nix-ninja/src/local.rs
++++ b/crates/nix-ninja/src/local.rs
+@@ -17,7 +17,10 @@
+         .collect();
+ 
+     // Build derived paths so the Nix store paths exist on the host.
+-    let store_paths = rpc_client.build_paths(store_dir, &derived_paths)?;
++    let store_paths = {
++        let _span = crate::profile::span("store.build_paths");
++        rpc_client.build_paths(store_dir, &derived_paths)?
++    };
+ 
+     // Create mapping from build_path to actual store path
+     let built_paths: HashMap<PathBuf, PathBuf> = derived_files
+@@ -46,7 +49,10 @@
+         .iter()
+         .map(|df| df.derived_path.clone())
+         .collect();
+-    let store_paths = rpc_client.build_paths(store_dir, &derived_paths)?;
++    let store_paths = {
++        let _span = crate::profile::span("store.build_paths");
++        rpc_client.build_paths(store_dir, &derived_paths)?
++    };
+ 
+     // Create new DerivedFiles with opaque store paths instead of placeholders
+     let opaque_files: Vec<DerivedFile> = derived_files
+diff --git a/crates/nix-ninja/src/profile.rs b/crates/nix-ninja/src/profile.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/nix-ninja/src/profile.rs
+@@ -0,0 +1,109 @@
++use anyhow::{ensure, Context, Result};
++use serde::Serialize;
++use std::collections::BTreeMap;
++use std::fs::{File, OpenOptions};
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{LazyLock, Mutex};
++use std::time::Instant;
++
++static ENABLED: AtomicBool = AtomicBool::new(false);
++static METRICS: LazyLock<Mutex<BTreeMap<&'static str, Metric>>> = LazyLock::new(Mutex::default);
++
++#[derive(Default, Serialize)]
++struct Metric {
++    calls: u64,
++    elapsed_ns: u128,
++}
++
++pub struct Span {
++    name: &'static str,
++    start: Option<Instant>,
++}
++
++pub fn span(name: &'static str) -> Span {
++    Span {
++        name,
++        start: ENABLED.load(Ordering::Relaxed).then(Instant::now),
++    }
++}
++
++impl Drop for Span {
++    fn drop(&mut self) {
++        if let Some(start) = self.start {
++            let elapsed_ns = start.elapsed().as_nanos();
++            let mut metrics = METRICS.lock().unwrap_or_else(|error| error.into_inner());
++            let metric = metrics.entry(self.name).or_default();
++            metric.calls += 1;
++            metric.elapsed_ns += elapsed_ns;
++        }
++    }
++}
++
++pub struct Report {
++    file: File,
++    start: Instant,
++    build_directory: PathBuf,
++}
++
++pub fn report(
++    build_directory: &Path,
++    owned_inputs: Option<&Path>,
++    inside_derivation: bool,
++) -> Result<Option<Report>> {
++    let Some(path) = std::env::var_os("NIX_NINJA_PROFILE") else {
++        return Ok(None);
++    };
++    ensure!(!inside_derivation, "diagnostics require local mode");
++    let path = std::path::absolute(PathBuf::from(path))?;
++    let parent = path
++        .parent()
++        .context("profile needs a parent directory")?
++        .canonicalize()?;
++    let build_directory = build_directory.canonicalize()?;
++    ensure!(
++        !parent.starts_with(&build_directory),
++        "profile must be outside the build directory"
++    );
++    if let Some(inputs) = owned_inputs {
++        ensure!(
++            !parent.starts_with(inputs),
++            "profile must be outside owned inputs"
++        );
++    }
++    let file = OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(&path)
++        .with_context(|| format!("create profile {}", path.display()))?;
++    METRICS
++        .lock()
++        .unwrap_or_else(|error| error.into_inner())
++        .clear();
++    ENABLED.store(true, Ordering::Relaxed);
++    Ok(Some(Report {
++        file,
++        start: Instant::now(),
++        build_directory,
++    }))
++}
++
++impl Drop for Report {
++    fn drop(&mut self) {
++        ENABLED.store(false, Ordering::Relaxed);
++        let elapsed_ns = self.start.elapsed().as_nanos();
++        let metrics = METRICS.lock().unwrap_or_else(|error| error.into_inner());
++        let value = serde_json::json!({
++            "schema_version": 1,
++            "mode": "planning-profile",
++            "build_directory": self.build_directory,
++            "elapsed_ns": elapsed_ns,
++            "phase_semantics": "inclusive cumulative wall time; concurrent phases overlap",
++            "count_semantics": "planner API invocations including failures; not wire requests or daemon operations",
++            "phases": *metrics,
++        });
++        if let Err(error) = serde_json::to_writer(&mut self.file, &value) {
++            eprintln!("could not write planning profile: {error}");
++        }
++    }
++}
+diff --git a/crates/nix-ninja/src/task.rs b/crates/nix-ninja/src/task.rs
+--- a/crates/nix-ninja/src/task.rs
++++ b/crates/nix-ninja/src/task.rs
+@@ -341,6 +341,7 @@
+     }
+ 
+     fn new_task(&mut self, files: &mut graph::GraphFiles, build: &Build) -> Result<Task> {
++        let _span = crate::profile::span("action.prepare");
+         let store_dir = self.config.store_dir.to_string();
+ 
+         // Provide the task access to all the original files for explicit
+@@ -488,6 +489,7 @@
+     rpc_client: &Arc<BuilderRpcClient>,
+     task: Task,
+ ) -> Result<Derivation> {
++    let _span = crate::profile::span("action.construct");
+     let cmdline = match &task.cmdline {
+         Some(c) => c,
+         None => {
+@@ -708,6 +710,7 @@
+     input_drv: Derivation,
+     built_inputs: Vec<DerivedFile>,
+ ) -> Result<Derivation> {
++    let _span = crate::profile::span("action.construct_dynamic");
+     let mut drv = Derivation::new(
+         format!("{}.drv", input_drv.name).parse()?,
+         input_drv.platform.clone(),
+@@ -788,7 +791,10 @@
+     // Serialize the derivation and add it to the nix store
+     let drv_json = serde_json::to_string(&input_drv)?;
+     let drv_json_name = format!("drv-{}.json", input_drv.name);
+-    let drv_json_path = rpc_client.add_to_store_text(&drv_json_name, drv_json.as_bytes())?;
++    let drv_json_path = {
++        let _span = crate::profile::span("store.add_text");
++        rpc_client.add_to_store_text(&drv_json_name, drv_json.as_bytes())?
++    };
+ 
+     // Add derivation.json as input dependency and argument
+     drv.inputs
+@@ -813,6 +819,7 @@
+     mut drv: Derivation,
+     config: &RunnerConfig,
+ ) -> Result<SingleDerivedPath> {
++    let _span = crate::profile::span("action.resolve");
+     // Collect built inputs when deps == "gcc" for dynamic dependency discovery
+     let built_inputs: Vec<DerivedFile> = if task.deps.as_ref() == Some(&"gcc".to_string()) {
+         task.inputs
+@@ -835,7 +842,10 @@
+                 drv,
+                 built_inputs,
+             )?;
+-            let dynamic_drv_path = rpc_client.add_drv_to_store(&config.store_dir, &dynamic_drv)?;
++            let dynamic_drv_path = {
++                let _span = crate::profile::span("store.add_derivation");
++                rpc_client.add_drv_to_store(&config.store_dir, &dynamic_drv)?
++            };
+             Ok(SingleDerivedPath::Built {
+                 drv_path: Arc::new(SingleDerivedPath::Opaque(dynamic_drv_path)),
+                 output: "out".parse().unwrap(),
+@@ -863,11 +873,17 @@
+                 &config.store_dir,
+             )?;
+ 
+-            let drv_path = rpc_client.add_drv_to_store(&config.store_dir, &drv)?;
++            let drv_path = {
++                let _span = crate::profile::span("store.add_derivation");
++                rpc_client.add_drv_to_store(&config.store_dir, &drv)?
++            };
+             Ok(SingleDerivedPath::Opaque(drv_path))
+         }
+     } else {
+-        let drv_path = rpc_client.add_drv_to_store(&config.store_dir, &drv)?;
++        let drv_path = {
++            let _span = crate::profile::span("store.add_derivation");
++            rpc_client.add_drv_to_store(&config.store_dir, &drv)?
++        };
+         Ok(SingleDerivedPath::Opaque(drv_path))
+     }
+ }
+@@ -955,7 +971,10 @@
+         .file_name()
+         .map(|n| n.to_string_lossy().into_owned())
+         .unwrap_or_else(|| "source".to_string());
+-    let store_path = rpc_client.add_to_store_nar(&name, &canonical_path)?;
++    let store_path = {
++        let _span = crate::profile::span("store.add_nar");
++        rpc_client.add_to_store_nar(&name, &canonical_path)?
++    };
+ 
+     Ok(DerivedFile {
+         derived_path: SingleDerivedPath::Opaque(store_path),
+@@ -1006,6 +1025,7 @@
+     files: Vec<PathBuf>,
+     c_includes: Vec<PathBuf>,
+ ) -> Result<(Vec<DerivedFile>, Vec<StorePath>)> {
++    let _span = crate::profile::span("discovery.materialize");
+     let mut discovered_deps = Vec::new();
+     let mut discovered_store_paths = Vec::new();
+ 

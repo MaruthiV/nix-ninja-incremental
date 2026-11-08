@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "base_variant": "recording",
+  "base_series_sha256": "883de43f8027dd746124463b6da872f3998c80e4ef6ad6ee8b7a52de74b291fa",
+  "reference_binary_sha256": "a9bdf2d1ba5d26a136e1b64602d9e0cc2b56232038e47ce006d3c30bc164052a",
+  "patch": {
+    "file": "instrumentation.patch",
+    "sha256": "08e9d0c7fbac129b0975255a2818c775ce107bcf5947d8bf0d0dd9be218bf14a",
+    "postimage_sha256": {
+      "crates/nix-ninja/src/build.rs": "3833ad8a763acf708256d96ace8d4dc8ee2273fcce344ad724551853f7939aa7",
+      "crates/nix-ninja/src/cli.rs": "cf3eea86f540684bc88ad37a317f15d211675b4b4422e6f46b136f7f0ca1458b",
+      "crates/nix-ninja/src/lib.rs": "cde68a5a6e027a3d70750da173bb9f87aecec0d4793e4d97b67a197e2c354c93",
+      "crates/nix-ninja/src/local.rs": "cf6581e932cc0151dfb20466d3f86e58d8519b80b733ab51eb3f1b8b10d29b6f",
+      "crates/nix-ninja/src/profile.rs": "9e0cf55b9d590174aa0b0345c8242c6086a5f5d54f72024eb879e4be283d671b",
+      "crates/nix-ninja/src/task.rs": "fe5048d1eb03b8c6018f005789a2d5917d60ef5399262fbdfa1bbce5f7b5c704"
+    }
+  },
+  "scope": "supplementary local planner operation counts; primary recording source and timing results unchanged",
+  "count_semantics": "planner API invocations including failures, not wire requests, unique objects or daemon operations",
+  "duration_semantics": "inclusive cumulative worker durations overlap; diagnostic elapsed times are not final speedup samples"
+}
