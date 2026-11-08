@@ -2,7 +2,7 @@
 
 Validated persistent dependency discovery for [PDT Partners' nix-ninja](https://github.com/pdtpartners/nix-ninja), with independent artifact tests and reproducible planning/build measurements. This is an independent extension against a pinned upstream revision.
 
-The reuse path is implemented and has passed native artifact, recovery, real-workload and full Nix functional checks. The larger campaign and repeated performance study are running; no final speedup is claimed yet.
+The frozen reuse implementation has passed native artifact/recovery checks, the full 256-seed edit campaign, real-workload audits and full Nix functional checks. Repeated planning and store-warm evaluation are complete; corrected cold-build evaluation is in progress. Broad-header regressions remain visible in the study.
 
 ## What it does
 
@@ -41,7 +41,19 @@ python3 tools/dev.py stop
 
 The artifact oracle rebuilds each reference state with fresh independent Ninja, compares artifact bytes and program behavior, checks all-mode derivation agreement, and injects skipped-rebuild faults. Fixtures include preserved mtimes, missing/shadowing headers, aliases, embedded resources, invalid source/recovery, generated producers and graph transitions. Lifecycle checks cover malformed state, publication/recovery, permissions and locks.
 
-Raw logs, manifests and results stay under ignored `results/`; pinned source/build trees stay under ignored `.work/`. `stop` retains the project container's store for inspection. Native benchmark workflows use fresh runners; cold trials require a fresh disposable project store and verify exact protected inventories between modes. Darwin-hosted emulated runs are diagnostic, not final timing evidence.
+Raw logs, manifests and results stay under ignored `results/`; pinned source/build trees stay under ignored `.work/`. `stop` retains the project container's store for inspection. Native benchmark workflows use fresh runners; cold trials require a fresh disposable project store and exact restoration of valid paths and pinned CA build-trace maps between modes. Darwin-hosted emulated runs are diagnostic, not final timing evidence.
+
+For a focused demonstration after setup, run the ten-state graph oracle:
+
+```sh
+python3 tools/dev.py up
+python3 tools/dev.py exec -- nix-shell --impure \
+  --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).shell' \
+  --run 'python3 /workspace/tools/build_oracle.py --fixture /workspace/tests/fixtures/graph_build_edits.json --discovery-mode reuse'
+python3 tools/dev.py stop
+```
+
+It checks changed generators, generated outputs, implicit/order-only edges, output renaming and command changes against fresh independent Ninja results. Stable actions reuse while generated consumers retain conservative fallback. The printed result directory contains per-state artifacts, discovery counters and warm plans. This is a correctness demonstration.
 
 ## Native workflows and measurements
 
@@ -73,7 +85,7 @@ python3 tools/baseline_summary.py results/baseline-calibration \
 
 ## Evidence and scope
 
-The frozen reuse binary has passed [native artifact/lifecycle checks](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42431292377), a [bounded seeded campaign](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42431292422), [real workload audits](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42431292426), [full Nix functional validation](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42432062401), and [owned-store lifecycle checks](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42433696359). These provide bounded evidence for the stated contract. Whole Nix functional validation is distinct from independent whole-binary equivalence; the small fixtures compare fresh bytes directly.
+The frozen reuse binary has passed [native artifact/lifecycle checks](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42431292377), the [full 256-seed campaign](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42433715029), [expanded graph and recovery checks](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42438687034), [real workload audits](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42431292426), and [full Nix functional validation](https://github.com/MaruthiV/nix-ninja-incremental/actions/runs/42432062401). These provide bounded evidence for the stated contract. Whole Nix functional validation is distinct from independent whole-binary equivalence; the small fixtures compare fresh bytes directly.
 
 Exact upstream/workload/runtime pins are in [environment/pins.json](environment/pins.json). [patches/series.json](patches/series.json) records patch hashes, dependencies and expected source postimages; `tools/variants.py` verifies them before preparing a variant. Profiling and historical baseline variants are separate from the final `recording` stack.
 
