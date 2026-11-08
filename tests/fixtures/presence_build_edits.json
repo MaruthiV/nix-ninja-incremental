@@ -165,6 +165,54 @@
       },
       "expected_exit": 18,
       "stale_probe": true
+    },
+    {
+      "name": "cross-file-transitive-query-alias",
+      "write": {
+        "main.c": "#/* dependency comment\n*/include \"defs/query.h\"\n#if PROBE(\"marker.h\")\n#define LOCAL 1\n#else\n#define LOCAL 0\n#endif\n#if PROBE(<ordered.h>)\n#define ORDERED 2\n#else\n#define ORDERED 0\n#endif\n#if PROBE(\"alias.h\")\n#define ALIASED 4\n#else\n#define ALIASED 0\n#endif\n#if PROBE(\"marker.h\") && PROBE(<ordered.h>)\n#define BOTH 8\n#else\n#define BOTH 0\n#endif\nint value(void);\nint main(void) { return value() + LOCAL + ORDERED + ALIASED + BOTH; }\n",
+        "defs/query.h": "#ifndef PROBE\n# ifdef __has_include\n/*\n * not PROBE(x)\n */\n# define ROOT __has_include\n# define PROBE ROOT\n# else\n# define PROBE(x) 0\n# endif\n#endif\n"
+      },
+      "expected_exit": 18,
+      "unchanged_artifact": true
+    },
+    {
+      "name": "aliased-negative-query",
+      "remove": [
+        "marker.h"
+      ],
+      "expected_exit": 9,
+      "stale_probe": true
+    },
+    {
+      "name": "aliased-query-file-appears",
+      "write": {
+        "marker.h": "not c again\n"
+      },
+      "expected_exit": 18,
+      "stale_probe": true
+    },
+    {
+      "name": "query-alias-becomes-constant-fallback",
+      "write": {
+        "defs/query.h": "#define PROBE(x) 0\n"
+      },
+      "expected_exit": 3,
+      "stale_probe": true
+    },
+    {
+      "name": "command-query-alias",
+      "write": {
+        "main.c": "#if PROBE(\"marker.h\")\n#define LOCAL 1\n#else\n#define LOCAL 0\n#endif\n#if PROBE(<ordered.h>)\n#define ORDERED 2\n#else\n#define ORDERED 0\n#endif\n#if PROBE(\"alias.h\")\n#define ALIASED 4\n#else\n#define ALIASED 0\n#endif\n#if PROBE(\"marker.h\") && PROBE(<ordered.h>)\n#define BOTH 8\n#else\n#define BOTH 0\n#endif\nint value(void);\nint main(void) { return value() + LOCAL + ORDERED + ALIASED + BOTH; }\n"
+      },
+      "build_ninja": "rule cc\n  command = cc -DPROBE=__has_include -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -I../source/early -I../source/late -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nbuild main.o: cc ../source/main.c\nbuild lib.o: cc ../source/lib.c\nbuild app: link main.o lib.o\n",
+      "expected_exit": 18,
+      "stale_probe": true
+    },
+    {
+      "name": "command-query-constant-fallback",
+      "build_ninja": "rule cc\n  command = cc '-DPROBE(x)=0' -O2 -g0 -frandom-seed=0 -fdiagnostics-color=never -I../source/early -I../source/late -MD -MF $out.d -o $out -c $in\n  depfile = $out.d\n  deps = gcc\nrule link\n  command = cc -frandom-seed=0 $in -o $out\nbuild main.o: cc ../source/main.c\nbuild lib.o: cc ../source/lib.c\nbuild app: link main.o lib.o\n",
+      "expected_exit": 3,
+      "stale_probe": true
     }
   ]
 }

@@ -1,0 +1,1709 @@
+diff --git a/crates/deps-infer/src/c_include_parser.rs b/crates/deps-infer/src/c_include_parser.rs
+index 132f333..6f015d0 100644
+--- a/crates/deps-infer/src/c_include_parser.rs
++++ b/crates/deps-infer/src/c_include_parser.rs
+@@ -1,7 +1,8 @@
++use crate::c_queries::{self, Aliases, Call, Definition, Facts, LITERAL};
++use crate::c_source::Source;
+ use crate::gcc_include_parser;
+ use crate::observations::{DiscoveryTrace, ReadView, Recorder};
+ use anyhow::{anyhow, ensure, Result};
+-use regex::Regex;
+ use std::borrow::Borrow;
+ use std::collections::HashMap;
+ use std::collections::{HashSet, VecDeque};
+@@ -11,7 +12,7 @@ use std::fs::File;
+ use std::hash::Hash;
+ use std::io::{BufRead, BufReader, Cursor};
+ use std::path::{Component, Path, PathBuf};
+-use std::sync::{Arc, LazyLock, RwLock};
++use std::sync::{Arc, RwLock};
+ 
+ pub fn retrieve_c_includes(
+     cmdline: &str,
+@@ -26,6 +27,7 @@ pub fn retrieve_c_includes(
+         virtual_paths,
+         None,
+         &PathCache::default(),
++        c_queries::command_definitions(cmdline).map_err(anyhow::Error::msg)?,
+     )
+ }
+ 
+@@ -42,6 +44,7 @@ pub fn retrieve_c_dependency_paths(
+         virtual_paths,
+         None,
+         &PathCache::build_paths(),
++        c_queries::command_definitions(cmdline).map_err(anyhow::Error::msg)?,
+     )
+ }
+ 
+@@ -59,6 +62,7 @@ pub fn retrieve_c_includes_observed(
+         None,
+         Some(&recorder),
+         &PathCache::default(),
++        c_queries::command_definitions(cmdline).map_err(anyhow::Error::msg)?,
+     )?;
+     Ok((result, recorder.trace()))
+ }
+@@ -77,6 +81,7 @@ pub fn retrieve_c_dependency_paths_observed(
+         None,
+         Some(&recorder),
+         &PathCache::build_paths(),
++        c_queries::command_definitions(cmdline).map_err(anyhow::Error::msg)?,
+     )?;
+     Ok((result, recorder.trace()))
+ }
+@@ -89,11 +94,13 @@ fn bfs_parse_includes(
+     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+     observer: Option<&Arc<Recorder>>,
+     path_cache: &PathCache,
++    mut definitions: Vec<Definition>,
+ ) -> Result<Vec<PathBuf>> {
+     let mut visited = HashSet::new();
+     let mut scheduled = HashSet::new();
+     let mut result = Vec::new();
+     let mut queue = VecDeque::new();
++    let mut probes: Vec<(PathBuf, Call)> = Vec::new();
+ 
+     // Initialize queue with starting files
+     for file in files {
+@@ -125,6 +132,19 @@ fn bfs_parse_includes(
+ 
+         // Process each source's includes
+         for source in sources_with_includes {
++            definitions.extend(source.dependencies.facts.definitions);
++            probes.extend(
++                source
++                    .dependencies
++                    .facts
++                    .calls
++                    .into_iter()
++                    .map(|call| (source.path.clone(), call)),
++            );
++            ensure!(
++                definitions.len() <= 100_000 && probes.len() <= 100_000,
++                "query discovery budget exceeded"
++            );
+             for include in source.dependencies.headers {
+                 if visited.insert(include.clone()) {
+                     result.push(include.clone());
+@@ -141,6 +161,25 @@ fn bfs_parse_includes(
+         }
+     }
+ 
++    let aliases = Aliases::new(&definitions).map_err(anyhow::Error::msg)?;
++    for (caller, probe) in probes {
++        if aliases.contains(&probe.name) {
++            if let Some(path) = resolve_header(
++                &caller,
++                &probe.header,
++                include_dirs,
++                virtual_paths.as_ref(),
++                path_cache,
++                observer,
++                true,
++            )? {
++                if visited.insert(path.clone()) {
++                    result.push(path);
++                }
++            }
++        }
++    }
++
+     Ok(result)
+ }
+ 
+@@ -154,6 +193,7 @@ pub struct SourceWithIncludes {
+ struct Dependencies {
+     headers: Vec<PathBuf>,
+     resources: Vec<PathBuf>,
++    facts: Facts,
+ }
+ 
+ impl Dependencies {
+@@ -265,11 +305,6 @@ where
+     Ok(results)
+ }
+ 
+-static INCLUDE_REGEX: LazyLock<Regex> =
+-    LazyLock::new(|| Regex::new(r##"^\s*#\s*(include|embed)\s*(["<])([^">]*)[">]"##).unwrap());
+-static PRESENCE_REGEX: LazyLock<Regex> =
+-    LazyLock::new(|| Regex::new(r##"\b__has_(include)\s*\(\s*(["<])([^">]+)[">]\s*\)"##).unwrap());
+-
+ /// Given a C-like source, try to resolve includes.
+ ///
+ /// Includes are generally of the form `#include <name>` or `#include "name"`
+@@ -338,82 +373,99 @@ fn extract_from_reader<R: BufRead>(
+     path_cache: &PathCache,
+     observer: Option<&Arc<Recorder>>,
+ ) -> Result<Dependencies> {
+-    let mut result = Dependencies::default();
+-    let parent_dir = PathBuf::from(path.parent().unwrap());
+-
+-    let lines = reader.lines();
+-
+-    for line in lines {
+-        let line = match line {
+-            Ok(l) => l,
+-            Err(_) => {
+-                // Usually this means the file isn't UTF-8 and we can skip.
+-                return Ok(result);
+-            }
+-        };
+-
+-        for (captures, presence) in INCLUDE_REGEX
+-            .captures_iter(&line)
+-            .map(|captures| (captures, false))
+-            .chain(
+-                PRESENCE_REGEX
+-                    .captures_iter(&line)
+-                    .map(|captures| (captures, true)),
+-            )
+-        {
+-            let embedded = captures.get(1).unwrap().as_str() == "embed";
+-            let inc_type = captures.get(2).unwrap().as_str();
+-            let relative_path = PathBuf::from(captures.get(3).unwrap().as_str());
+-            let search_dirs = if embedded { embed_dirs } else { include_dirs };
+-            let resolve = |directory: &Path| -> Result<Option<PathBuf>> {
+-                let Some(candidate) = try_resolve(
+-                    directory,
+-                    &relative_path,
+-                    virtual_paths,
+-                    path_cache,
+-                    observer,
+-                )?
+-                else {
+-                    return Ok(None);
+-                };
+-                if presence {
+-                    let regular = if let Some(observer) = observer {
+-                        observer.is_file(&candidate)?
+-                    } else {
+-                        canonicalize_with_cache(candidate.clone(), virtual_paths, path_cache, None)?
+-                            .is_some_and(|target| target.is_file())
+-                    };
+-                    if !regular {
+-                        return Ok(None);
+-                    }
+-                }
+-                Ok(Some(candidate))
+-            };
+-            let mut resolved = None;
+-            if inc_type == "\"" {
+-                resolved = resolve(&parent_dir)?;
+-            }
+-            if resolved.is_none() {
+-                for directory in search_dirs {
+-                    resolved = resolve(directory)?;
+-                    if resolved.is_some() {
+-                        break;
+-                    }
+-                }
+-            }
+-            if let Some(path) = resolved {
+-                if embedded || presence {
+-                    result.resources.push(path);
++    let mut bytes = Vec::new();
++    let mut reader = reader;
++    reader.read_to_end(&mut bytes)?;
++    let source = Source::new(&bytes);
++    let facts = Facts::new(&source);
++    ensure!(
++        facts.definitions.len() <= 100_000 && facts.calls.len() <= 100_000,
++        "query discovery budget exceeded"
++    );
++    let aliases = Aliases::new(&facts.definitions).map_err(anyhow::Error::msg)?;
++    let mut result = Dependencies {
++        facts,
++        ..Dependencies::default()
++    };
++    for (offset, line) in source.lines() {
++        if let Some(captures) = LITERAL.captures(line).filter(|_| {
++            line.find('#')
++                .is_some_and(|index| source.is_code(offset + index))
++        }) {
++            let embedded = &captures[1] == "embed";
++            let directories = if embedded { embed_dirs } else { include_dirs };
++            if let Some(found) = resolve_header(
++                path,
++                &captures[2],
++                directories,
++                virtual_paths,
++                path_cache,
++                observer,
++                false,
++            )? {
++                if embedded {
++                    result.resources.push(found);
+                 } else {
+-                    result.headers.push(path);
++                    result.headers.push(found);
+                 }
+             }
+         }
+     }
+-
++    for call in &result.facts.calls {
++        if aliases.contains(&call.name) {
++            if let Some(found) = resolve_header(
++                path,
++                &call.header,
++                include_dirs,
++                virtual_paths,
++                path_cache,
++                observer,
++                true,
++            )? {
++                result.resources.push(found);
++            }
++        }
++    }
+     Ok(result)
+ }
+ 
++fn resolve_header(
++    caller: &Path,
++    header: &str,
++    directories: &[PathBuf],
++    virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
++    path_cache: &PathCache,
++    observer: Option<&Arc<Recorder>>,
++    regular: bool,
++) -> Result<Option<PathBuf>> {
++    let file = Path::new(&header[1..header.len() - 1]);
++    let parent = caller.parent().unwrap();
++    let quoted = header.starts_with('"');
++    for directory in quoted
++        .then_some(parent)
++        .into_iter()
++        .chain(directories.iter().map(PathBuf::as_path))
++    {
++        let Some(candidate) = try_resolve(directory, file, virtual_paths, path_cache, observer)?
++        else {
++            continue;
++        };
++        if regular {
++            let is_file = if let Some(observer) = observer {
++                observer.is_file(&candidate)?
++            } else {
++                canonicalize_with_cache(candidate.clone(), virtual_paths, path_cache, None)?
++                    .is_some_and(|target| target.is_file())
++            };
++            if !is_file {
++                continue;
++            }
++        }
++        return Ok(Some(candidate));
++    }
++    Ok(None)
++}
++
+ fn try_resolve(
+     head: &Path,
+     tail: &Path,
+@@ -838,6 +890,72 @@ mod resolver_tests {
+             .unwrap());
+     }
+ 
++    #[test]
++    fn aliased_query_images_match_the_real_compiler() {
++        let body = "#if QUERY(\"marker.h\")\nint main(void) { return 1; }\n#else\nint main(void) { return 0; }\n#endif\n";
++        for (prefix, definitions, flags, continued) in [
++            ("#define QUERY __has_include\n", "", "", false),
++            ("#include \"../defs/query.h\"\n", "#define QUERY __has_include\n", "", false),
++            ("#include \"../defs/query.h\"\n", "#define ROOT __has_include\n#define QUERY ROOT\n", "", false),
++            ("", "", "-DQUERY=__has_include", false),
++            ("#define QUERY __has_include\n", "", "", true),
++            ("#ifndef QUERY\n#ifdef __has_include\n/*\n * not QUERY(x)\n */\n#define QUERY __has_include\n#else\n#define QUERY(x) 0\n#endif\n#endif\n", "", "", false),
++            ("#/* comment\n*/include \"../defs/query.h\"\n", "#define QUERY __has_include\n", "", false),
++        ] {
++            let fixture = Fixture::new();
++            let text = if continued { body.replace("QUERY(", "QUERY\\\n(") } else { body.to_owned() };
++            let source = fixture.write("caller/main.c", &format!("{prefix}{text}"));
++            let marker = fixture.write("caller/marker.h", "this is not c\n");
++            fixture.write("defs/query.h", definitions);
++            let command = format!("cc -std=c17 -nostdinc {flags} caller/main.c -o app");
++            let paths = retrieve_c_dependency_paths(&command, vec![source], None).unwrap();
++            assert!(paths.contains(&marker));
++            let image = Fixture::new();
++            for path in paths {
++                let target = image.0.join(path.strip_prefix(&fixture.0).unwrap());
++                fs::create_dir_all(target.parent().unwrap()).unwrap();
++                fs::copy(path, target).unwrap();
++            }
++            for directory in [&fixture.0, &image.0] {
++                let mut arguments = vec!["-std=c17", "-nostdinc"];
++                if !flags.is_empty() { arguments.push(flags); }
++                arguments.extend(["caller/main.c", "-o", "app"]);
++                let compiled = std::process::Command::new("cc").args(&arguments).current_dir(directory).output().unwrap();
++                assert!(compiled.status.success(), "{compiled:?}");
++                let status = std::process::Command::new(directory.join("app")).status().unwrap();
++                assert_eq!(status.code(), Some(1));
++            }
++        }
++    }
++
++    #[test]
++    fn named_queries_observe_negative_candidates_and_current_alias_headers() {
++        let fixture = Fixture::new();
++        let main = fixture.write(
++            "main.c",
++            "#include \"query.h\"\n#if QUERY(\"marker.h\")\n#endif\n",
++        );
++        fixture.write("query.h", "#define QUERY __has_include\n");
++        let view = Arc::new(ReadView::new(&fixture.0, &fixture.0).unwrap());
++        let (_, trace) =
++            retrieve_c_dependency_paths_observed("cc", vec![main.clone()], view).unwrap();
++        let marker = fixture.write("marker.h", "not c");
++        assert_eq!(trace.resolutions.get(&marker), Some(&None));
++        assert!(!ReadView::new(&fixture.0, &fixture.0)
++            .unwrap()
++            .validate(&trace)
++            .unwrap());
++        let view = Arc::new(ReadView::new(&fixture.0, &fixture.0).unwrap());
++        let (paths, trace) = retrieve_c_dependency_paths_observed("cc", vec![main], view).unwrap();
++        assert!(paths.contains(&marker));
++        assert!(!trace.files.contains_key(&marker));
++        fixture.write("query.h", "#define QUERY(x) 0\n");
++        assert!(!ReadView::new(&fixture.0, &fixture.0)
++            .unwrap()
++            .validate(&trace)
++            .unwrap());
++    }
++
+     #[test]
+     fn presence_queries_are_leaf_inputs_with_negative_searches() {
+         let fixture = Fixture::new();
+diff --git a/crates/deps-infer/src/c_queries.rs b/crates/deps-infer/src/c_queries.rs
+new file mode 100644
+index 0000000..838db39
+--- /dev/null
++++ b/crates/deps-infer/src/c_queries.rs
+@@ -0,0 +1,324 @@
++use crate::c_source::Source;
++use regex::Regex;
++use std::collections::{BTreeSet, HashMap, VecDeque};
++use std::ops::Range;
++use std::sync::LazyLock;
++
++pub static DIRECTIVE: LazyLock<Regex> =
++    LazyLock::new(|| Regex::new(r"^\s*#\s*([A-Za-z_][A-Za-z_0-9]*)").unwrap());
++pub static LITERAL: LazyLock<Regex> =
++    LazyLock::new(|| Regex::new(r##"^\s*#\s*(include|embed)\s*("[^"\n]+"|<[^>\n]+>)"##).unwrap());
++static DEFINITION: LazyLock<Regex> =
++    LazyLock::new(|| Regex::new(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z_0-9]*)(.*)$").unwrap());
++static IDENTIFIER: LazyLock<Regex> =
++    LazyLock::new(|| Regex::new(r"[A-Za-z_][A-Za-z_0-9]*").unwrap());
++static CALL: LazyLock<Regex> = LazyLock::new(|| {
++    Regex::new(r##"\b([A-Za-z_][A-Za-z_0-9]*)\s*\(\s*("[^"\n]+"|<[^>\n]+>)\s*\)"##).unwrap()
++});
++static FEATURE: LazyLock<Regex> = LazyLock::new(|| {
++    Regex::new(r"\bdefined\s*(?:\(\s*[A-Za-z_][A-Za-z_0-9]*\s*\)|[A-Za-z_][A-Za-z_0-9]*)").unwrap()
++});
++static FEATURE_DIRECTIVE: LazyLock<Regex> =
++    LazyLock::new(|| Regex::new(r"^\s*#\s*ifn?def\s+[A-Za-z_][A-Za-z_0-9]*\b").unwrap());
++
++#[derive(Clone)]
++pub enum Replacement {
++    Alias(String),
++    Constant,
++    Other,
++}
++
++#[derive(Clone)]
++pub struct Definition {
++    pub name: String,
++    pub replacement: Replacement,
++    pub references: Vec<String>,
++    pub range: Range<usize>,
++}
++
++#[derive(Clone)]
++pub struct Call {
++    pub name: String,
++    pub header: String,
++    pub range: Range<usize>,
++}
++
++#[derive(Default)]
++pub struct Facts {
++    pub definitions: Vec<Definition>,
++    pub calls: Vec<Call>,
++}
++
++impl Facts {
++    pub fn new(source: &Source) -> Self {
++        let mut facts = Self::default();
++        for (offset, line) in source.lines() {
++            let Some(hash) = line
++                .find('#')
++                .filter(|index| source.is_code(offset + index))
++            else {
++                continue;
++            };
++            if !line[..hash].trim().is_empty() {
++                continue;
++            }
++            if let Some(definition) = DEFINITION.captures(line) {
++                let tail = definition.get(2).unwrap();
++                let function = tail.as_str().starts_with('(');
++                let body = if function {
++                    tail.as_str()
++                        .split_once(')')
++                        .map_or("", |(_, body)| body)
++                        .trim()
++                } else {
++                    tail.as_str().trim()
++                };
++                let replacement = if matches!(body, "0" | "1") {
++                    Replacement::Constant
++                } else if !function
++                    && IDENTIFIER
++                        .find(body)
++                        .is_some_and(|value| value.as_str() == body)
++                {
++                    Replacement::Alias(body.to_owned())
++                } else {
++                    Replacement::Other
++                };
++                let references = IDENTIFIER
++                    .find_iter(tail.as_str())
++                    .filter(|value| source.is_code(offset + tail.start() + value.start()))
++                    .map(|value| value.as_str().to_owned())
++                    .collect();
++                facts.definitions.push(Definition {
++                    name: definition[1].to_owned(),
++                    replacement,
++                    references,
++                    range: offset..offset + line.len(),
++                });
++                if facts.definitions.len() > 100_000 {
++                    break;
++                }
++            }
++        }
++        for call in CALL.captures_iter(&source.text) {
++            let span = call.get(0).unwrap();
++            if source.is_code(span.start()) {
++                facts.calls.push(Call {
++                    name: call[1].to_owned(),
++                    header: call[2].to_owned(),
++                    range: span.range(),
++                });
++                if facts.calls.len() > 100_000 {
++                    break;
++                }
++            }
++        }
++        facts
++    }
++
++    pub fn estimated_bytes(&self) -> usize {
++        let definitions = self.definitions.iter().map(|definition| {
++            let target = match &definition.replacement {
++                Replacement::Alias(value) => value.len(),
++                _ => 0,
++            };
++            definition.references.iter().fold(
++                128usize
++                    .saturating_add(definition.name.len())
++                    .saturating_add(target),
++                |size, value| size.saturating_add(value.len()).saturating_add(32),
++            )
++        });
++        let calls = self.calls.iter().map(|call| {
++            96usize
++                .saturating_add(call.name.len())
++                .saturating_add(call.header.len())
++        });
++        definitions.chain(calls).fold(0, usize::saturating_add)
++    }
++}
++
++pub fn command_definitions(command: &str) -> Result<Vec<Definition>, &'static str> {
++    let args = shell_words::split(command).map_err(|_| "command-syntax")?;
++    let mut definitions = Vec::new();
++    let mut index = 0;
++    while index < args.len() {
++        let value = if args[index] == "-D" {
++            index += 1;
++            Some(args.get(index).ok_or("missing-macro-definition")?.as_str())
++        } else {
++            args[index].strip_prefix("-D")
++        };
++        if let Some(value) = value {
++            if value.contains(['\n', '\r']) {
++                return Err("unsupported-command-macro");
++            }
++            let (name, replacement) = value.split_once('=').unwrap_or((value, "1"));
++            let source = Source::new(format!("#define {name} {replacement}\n").as_bytes());
++            let facts = Facts::new(&source);
++            if !source.complete || facts.definitions.len() != 1 {
++                return Err("unsupported-command-macro");
++            }
++            definitions.extend(facts.definitions);
++        }
++        index += 1;
++    }
++    Ok(definitions)
++}
++
++pub struct Aliases {
++    names: BTreeSet<String>,
++}
++
++impl Aliases {
++    pub fn new(definitions: &[Definition]) -> Result<Self, &'static str> {
++        if definitions.len() > 100_000 {
++            return Err("query-definition-budget");
++        }
++        let mut reverse = HashMap::<&str, Vec<&str>>::new();
++        for definition in definitions {
++            if let Replacement::Alias(target) = &definition.replacement {
++                reverse.entry(target).or_default().push(&definition.name);
++            }
++        }
++        let mut names = BTreeSet::from(["__has_include".to_owned()]);
++        let mut queue = VecDeque::from(["__has_include"]);
++        while let Some(target) = queue.pop_front() {
++            for name in reverse.get(target).into_iter().flatten() {
++                if names.insert((*name).to_owned()) {
++                    if names.len() > 4096 {
++                        return Err("query-alias-budget");
++                    }
++                    queue.push_back(name);
++                }
++            }
++        }
++        Ok(Self { names })
++    }
++
++    pub fn contains(&self, name: &str) -> bool {
++        self.names.contains(name)
++    }
++
++    pub fn check_definitions(&self, definitions: &[Definition]) -> Result<(), &'static str> {
++        for definition in definitions {
++            match &definition.replacement {
++                Replacement::Alias(target) if target == "__has_embed" => {
++                    return Err("unsupported-query-alias")
++                }
++                Replacement::Other
++                    if self.contains(&definition.name)
++                        || definition.name == "__has_embed"
++                        || definition
++                            .references
++                            .iter()
++                            .any(|name| self.contains(name) || name == "__has_embed") =>
++                {
++                    return Err("computed-query-alias")
++                }
++                _ => {}
++            }
++        }
++        Ok(())
++    }
++
++    pub fn check_source(&self, source: &Source, facts: &Facts) -> Result<(), &'static str> {
++        self.check_definitions(&facts.definitions)?;
++        let mut allowed: Vec<_> = facts
++            .definitions
++            .iter()
++            .map(|definition| definition.range.clone())
++            .collect();
++        for value in FEATURE
++            .find_iter(&source.text)
++            .filter(|value| source.is_code(value.start()))
++        {
++            allowed.push(value.range());
++        }
++        let mut embeds = BTreeSet::new();
++        for (offset, line) in source.lines() {
++            if let Some(value) = FEATURE_DIRECTIVE
++                .find(line)
++                .filter(|value| source.is_code(offset + value.as_str().find('#').unwrap()))
++            {
++                allowed.push(offset..offset + value.end());
++            }
++            if let Some(value) = LITERAL.captures(line).filter(|_| {
++                line.find('#')
++                    .is_some_and(|index| source.is_code(offset + index))
++            }) {
++                if &value[1] == "embed" {
++                    embeds.insert(value[2].to_owned());
++                }
++            }
++        }
++        for call in &facts.calls {
++            if self.contains(&call.name) || call.name == "__has_embed" {
++                if call.header[1..call.header.len() - 1].contains(['"', '>', '\\']) {
++                    return Err("unmodeled-header-name");
++                }
++                if call.name == "__has_embed" && !embeds.contains(&call.header) {
++                    return Err("unobserved-existence-query");
++                }
++                allowed.push(call.range.clone());
++            }
++        }
++        for value in IDENTIFIER
++            .find_iter(&source.text)
++            .filter(|value| source.is_code(value.start()))
++        {
++            if value.as_str() == "__has_include_next" {
++                return Err("include-next");
++            }
++            if (self.contains(value.as_str()) || value.as_str() == "__has_embed")
++                && !allowed.iter().any(|range| range.contains(&value.start()))
++            {
++                return Err("computed-query");
++            }
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn source_and_command_edges_resolve_transitively_with_cycles() {
++        let source = Source::new(b"#define FIRST __has_include\n#define SECOND FIRST\n#define LOOP OTHER\n#define OTHER LOOP\n");
++        let mut definitions = Facts::new(&source).definitions;
++        definitions.extend(command_definitions("cc -D THIRD=SECOND -DIGNORED=0").unwrap());
++        let aliases = Aliases::new(&definitions).unwrap();
++        assert!(aliases.contains("THIRD"));
++        assert!(!aliases.contains("LOOP"));
++    }
++
++    #[test]
++    fn comments_feature_checks_and_constant_fallbacks_are_not_queries() {
++        let source = Source::new(b"#ifndef QUERY\n#ifdef __has_include\n/*\n * not QUERY(x)\n */\n#define QUERY __has_include\n#else\n#define QUERY(x) 0\n#endif\n#endif\n#if QUERY(\"marker.h\")\n#endif\n");
++        let facts = Facts::new(&source);
++        let aliases = Aliases::new(&facts.definitions).unwrap();
++        assert!(aliases.check_source(&source, &facts).is_ok());
++    }
++
++    #[test]
++    fn computed_source_and_command_rewrites_stay_unsupported() {
++        for text in [
++            "#define QUERY(x) __has_include(x)\n",
++            "#define QUERY __has_include\n#if QUERY(PICK)\n#endif\n",
++        ] {
++            let source = Source::new(text.as_bytes());
++            let facts = Facts::new(&source);
++            assert!(Aliases::new(&facts.definitions)
++                .unwrap()
++                .check_source(&source, &facts)
++                .is_err());
++        }
++        let definitions = command_definitions("cc '-DQUERY(x)=__has_include(x)'").unwrap();
++        assert!(Aliases::new(&definitions)
++            .unwrap()
++            .check_definitions(&definitions)
++            .is_err());
++    }
++}
+diff --git a/crates/deps-infer/src/c_source.rs b/crates/deps-infer/src/c_source.rs
+new file mode 100644
+index 0000000..e9f1a22
+--- /dev/null
++++ b/crates/deps-infer/src/c_source.rs
+@@ -0,0 +1,279 @@
++pub struct Source {
++    pub text: String,
++    pub complete: bool,
++    code: Vec<bool>,
++}
++
++fn identifier(byte: u8) -> bool {
++    byte.is_ascii_alphanumeric() || byte == b'_'
++}
++
++fn splice_end(bytes: &[u8], index: usize) -> Option<usize> {
++    if bytes[index] != b'\\' {
++        return None;
++    }
++    let mut end = index + 1;
++    while bytes
++        .get(end)
++        .is_some_and(|byte| matches!(byte, b' ' | b'\t' | 11 | 12))
++    {
++        end += 1;
++    }
++    match bytes.get(end) {
++        Some(b'\n') => Some(end + 1),
++        Some(b'\r') => Some(end + 1 + usize::from(bytes.get(end + 1) == Some(&b'\n'))),
++        _ => None,
++    }
++}
++
++impl Source {
++    pub fn new(bytes: &[u8]) -> Self {
++        let mut complete = true;
++        let original = match std::str::from_utf8(bytes) {
++            Ok(_) => bytes,
++            Err(error) => {
++                complete = false;
++                let end = bytes[..error.valid_up_to()]
++                    .iter()
++                    .rposition(|byte| *byte == b'\n')
++                    .map_or(0, |index| index + 1);
++                &bytes[..end]
++            }
++        };
++        let mut prepared = Vec::new();
++        let mut origins = Vec::new();
++        let mut index = if original.starts_with(b"\xef\xbb\xbf") {
++            3
++        } else {
++            0
++        };
++        while index < original.len() {
++            if let Some(end) = splice_end(original, index) {
++                index = end;
++                continue;
++            }
++            let byte = original[index];
++            prepared.push(if byte == b'\r' { b'\n' } else { byte });
++            origins.push(index);
++            index += 1;
++            if byte == b'\r' && original.get(index) == Some(&b'\n') {
++                index += 1;
++            }
++        }
++        let mut text = Vec::new();
++        let mut code = Vec::new();
++        let mut index = 0;
++        while index < prepared.len() {
++            let tail = &prepared[index..];
++            if tail.starts_with(b"/*") || tail.starts_with(b"//") {
++                let block = tail[1] == b'*';
++                let end = if block {
++                    match tail[2..].windows(2).position(|part| part == b"*/") {
++                        Some(offset) => index + offset + 4,
++                        None => {
++                            complete = false;
++                            prepared.len()
++                        }
++                    }
++                } else {
++                    index
++                        + tail
++                            .iter()
++                            .position(|byte| *byte == b'\n')
++                            .unwrap_or(tail.len())
++                };
++                text.resize(text.len() + end - index, b' ');
++                code.resize(text.len(), false);
++                index = end;
++                continue;
++            }
++            if let Some(prefix) = [b"u8R\"".as_slice(), b"LR\"", b"uR\"", b"UR\"", b"R\""]
++                .into_iter()
++                .find(|prefix| tail.starts_with(prefix))
++            {
++                let delimiter_start = index + prefix.len();
++                let open = prepared[delimiter_start..]
++                    .iter()
++                    .take(17)
++                    .position(|byte| *byte == b'(')
++                    .map(|offset| delimiter_start + offset);
++                let Some(open) = open.filter(|open| {
++                    prepared[delimiter_start..*open]
++                        .iter()
++                        .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'(' | b')' | b'\\'))
++                }) else {
++                    complete = false;
++                    break;
++                };
++                let mut ending = vec![b')'];
++                ending.extend_from_slice(&prepared[delimiter_start..open]);
++                ending.push(b'"');
++                let start = origins[index];
++                let raw_open = origins[open];
++                if raw_open - start != open - index {
++                    complete = false;
++                }
++                let end = match original[raw_open + 1..]
++                    .windows(ending.len())
++                    .position(|part| part == ending)
++                {
++                    Some(offset) => raw_open + 1 + offset + ending.len(),
++                    None => {
++                        complete = false;
++                        original.len()
++                    }
++                };
++                text.extend_from_slice(&original[start..end]);
++                code.resize(text.len(), false);
++                index = origins.partition_point(|offset| *offset < end);
++                continue;
++            }
++            let byte = prepared[index];
++            if byte == b'"' || byte == b'\'' {
++                let mut end = index + 1;
++                let mut closed = false;
++                while end < prepared.len() && prepared[end] != b'\n' {
++                    if prepared[end] == byte {
++                        end += 1;
++                        closed = true;
++                        break;
++                    }
++                    end += if prepared[end] == b'\\' && end + 1 < prepared.len() {
++                        2
++                    } else {
++                        1
++                    };
++                }
++                complete &= closed;
++                text.extend_from_slice(&prepared[index..end]);
++                code.resize(text.len(), false);
++                index = end;
++                continue;
++            }
++            let mut end = index + 1;
++            let number = byte.is_ascii_digit()
++                || (byte == b'.' && prepared.get(end).is_some_and(u8::is_ascii_digit));
++            if number {
++                while end < prepared.len()
++                    && (identifier(prepared[end])
++                        || prepared[end] == b'.'
++                        || (prepared[end] == b'\''
++                            && prepared.get(end + 1).is_some_and(|byte| identifier(*byte))))
++                {
++                    end += 1;
++                }
++            } else if identifier(byte) {
++                while end < prepared.len() && identifier(prepared[end]) {
++                    end += 1;
++                }
++            }
++            text.extend_from_slice(&prepared[index..end]);
++            code.resize(text.len(), !number);
++            index = end;
++        }
++        Self {
++            text: String::from_utf8(text).unwrap(),
++            complete,
++            code,
++        }
++    }
++
++    pub fn is_code(&self, index: usize) -> bool {
++        self.code.get(index).copied().unwrap_or(false)
++    }
++
++    pub fn lines(&self) -> impl Iterator<Item = (usize, &str)> {
++        self.text.split_inclusive('\n').scan(0, |offset, line| {
++            let start = *offset;
++            *offset += line.len();
++            Some((start, line.strip_suffix('\n').unwrap_or(line)))
++        })
++    }
++
++    pub fn estimated_bytes(&self) -> usize {
++        self.text
++            .len()
++            .saturating_add(self.code.len())
++            .saturating_add(64)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn hashes(source: &Source) -> Vec<bool> {
++        source
++            .text
++            .match_indices('#')
++            .map(|(index, _)| source.is_code(index))
++            .collect()
++    }
++
++    #[test]
++    fn trailing_comments_and_comment_closures_keep_only_real_hashes() {
++        let source = Source::new(b"# ifndef assert /* prior #include <assert.h> */\n/*\n# example */ #include \"value.h\"\n");
++        assert!(source.complete);
++        assert_eq!(hashes(&source), vec![true, true]);
++        assert!(source
++            .text
++            .lines()
++            .last()
++            .unwrap()
++            .trim_start()
++            .starts_with("#include"));
++    }
++
++    #[test]
++    fn splices_are_joined_before_comments_are_recognized() {
++        let source = Source::new(b"#i\\\nnclude \"value.h\"\n/\\\n* #include \"fake.h\" */\n// # fake \\\n#include \"hidden.h\"\n");
++        assert!(source.complete);
++        assert_eq!(hashes(&source), vec![true]);
++        assert!(source.text.starts_with("#include \"value.h\""));
++    }
++
++    #[test]
++    fn quoted_and_raw_strings_do_not_expose_directives() {
++        let source = Source::new(
++            br##"const char *s = "/* #include fake */";
++auto r = u8R"tag(
++#include "fake.h"
++)tag";
++#include "real.h"
++"##,
++        );
++        assert!(source.complete);
++        assert_eq!(hashes(&source), vec![false, false, true]);
++    }
++
++    #[test]
++    fn raw_string_splices_cannot_create_a_terminator() {
++        let source = Source::new(b"auto s = R\"tag(before)ta\\\ng\"\n#include \"fake.h\"\n)tag\";\n#include \"real.h\"\n");
++        assert!(source.complete);
++        assert_eq!(hashes(&source), vec![false, true]);
++    }
++
++    #[test]
++    fn digit_separators_and_prefixed_characters_keep_following_code() {
++        let source = Source::new(b"auto n = 0xA'B + 1'000; auto c = u8'x';\n#include \"real.h\"\n");
++        assert!(source.complete);
++        assert_eq!(hashes(&source), vec![true]);
++        let number = Source::new(b"auto n = 10QUERY;\n");
++        assert!(!number.is_code(number.text.find("QUERY").unwrap()));
++    }
++
++    #[test]
++    fn invalid_utf8_keeps_only_complete_prior_lines() {
++        let source = Source::new(b"#include \"first.h\"\n#include \"second.h\"\xff\n");
++        assert!(!source.complete);
++        assert_eq!(source.text, "#include \"first.h\"\n");
++    }
++
++    #[test]
++    fn newlines_inside_comments_do_not_end_a_directive() {
++        let source = Source::new(b"#/* comment\n*/include \"value.h\"\n");
++        assert!(source.complete);
++        assert_eq!(source.lines().count(), 1);
++        assert!(crate::c_queries::LITERAL.is_match(&source.text));
++    }
++}
+diff --git a/crates/deps-infer/src/lib.rs b/crates/deps-infer/src/lib.rs
+index 8e13d9a..e2d9932 100644
+--- a/crates/deps-infer/src/lib.rs
++++ b/crates/deps-infer/src/lib.rs
+@@ -1,4 +1,6 @@
+ pub mod c_include_parser;
++pub mod c_queries;
++pub mod c_source;
+ pub mod gcc_depfile;
+ mod gcc_depfile_parser;
+ mod gcc_include_parser;
+diff --git a/crates/nix-ninja/src/discovery.rs b/crates/nix-ninja/src/discovery.rs
+index f3109d0..5196f3a 100644
+--- a/crates/nix-ninja/src/discovery.rs
++++ b/crates/nix-ninja/src/discovery.rs
+@@ -10,7 +10,7 @@ use deps_infer::c_include_parser::{
+ };
+ use deps_infer::observations::ReadView;
+ use serde::Serialize;
+-use std::collections::{BTreeMap, BTreeSet};
++use std::collections::{BTreeMap, BTreeSet, HashSet};
+ use std::path::{Path, PathBuf};
+ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex};
+@@ -18,6 +18,16 @@ use std::time::Instant;
+ 
+ const MAX_CAPTURE_BYTES: usize = 384 * 1024 * 1024;
+ 
++fn with_seeds(mut seeds: Vec<PathBuf>, found: Vec<PathBuf>) -> Vec<PathBuf> {
++    let mut present = HashSet::<_>::from_iter(seeds.iter().cloned());
++    seeds.extend(
++        found
++            .into_iter()
++            .filter(|path| present.insert(path.clone())),
++    );
++    seeds
++}
++
+ #[derive(Clone, Copy, Default, PartialEq, ValueEnum)]
+ pub enum Mode {
+     #[default]
+@@ -178,7 +188,80 @@ impl Discovery {
+ 
+     fn fresh(&self, command: &str, seeds: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+         self.scans.fetch_add(1, Ordering::Relaxed);
+-        retrieve_c_dependency_paths(command, seeds, None)
++        let sources = self
++            .source_seeds(command, &seeds)?
++            .unwrap_or_else(|| seeds.clone());
++        let found = retrieve_c_dependency_paths(command, sources, None)?;
++        Ok(with_seeds(seeds, found))
++    }
++
++    fn source_seeds(&self, command: &str, seeds: &[PathBuf]) -> Result<Option<Vec<PathBuf>>> {
++        let mut args = shell_words::split(command)?;
++        for (key, value) in &self.wrappers {
++            if key.starts_with("NIX_CFLAGS_COMPILE") {
++                args.extend(shell_words::split(value)?);
++            }
++        }
++        if args.iter().any(|arg| arg.starts_with('@')) {
++            return Ok(None);
++        }
++        let normalized = |path: &Path| -> Result<PathBuf> {
++            let mut value = self
++                .options
++                .lease
++                .cwd
++                .join(path)
++                .to_str()
++                .ok_or_else(|| anyhow::anyhow!("non-utf8 seed path"))?
++                .to_owned();
++            n2::canon::canonicalize_path(&mut value);
++            Ok(value.into())
++        };
++        let arguments = args
++            .iter()
++            .map(|arg| normalized(Path::new(arg)))
++            .collect::<Result<HashSet<_>>>()?;
++        let mut directories = vec![self.options.lease.cwd.clone()];
++        let mut forced = Vec::new();
++        let mut index = 1;
++        while index < args.len() {
++            let arg = &args[index];
++            let (kind, value) = if matches!(arg.as_str(), "-I" | "-include" | "-isystem") {
++                index += 1;
++                (arg.as_str(), args.get(index).map(String::as_str))
++            } else if let Some(value) = arg.strip_prefix("-include") {
++                ("-include", Some(value))
++            } else if let Some(value) = arg.strip_prefix("-isystem") {
++                ("-isystem", Some(value))
++            } else if let Some(value) = arg.strip_prefix("-I") {
++                ("-I", Some(value))
++            } else {
++                ("", None)
++            };
++            if let Some(value) = value {
++                if kind == "-include" {
++                    forced.push(PathBuf::from(value));
++                } else if !kind.is_empty() {
++                    directories.push(self.options.lease.cwd.join(value));
++                }
++            }
++            index += 1;
++        }
++        let mut roots = arguments;
++        for file in forced {
++            for directory in &directories {
++                roots.insert(normalized(&directory.join(&file))?);
++            }
++        }
++        let sources = seeds
++            .iter()
++            .filter_map(|path| match normalized(path) {
++                Ok(value) if roots.contains(&value) => Some(Ok(path.clone())),
++                Ok(_) => None,
++                Err(error) => Some(Err(error)),
++            })
++            .collect::<Result<Vec<_>>>()?;
++        Ok((!sources.is_empty()).then_some(sources))
+     }
+ 
+     pub fn discover(
+@@ -245,6 +328,10 @@ impl Discovery {
+                 }
+             };
+             let key = identity.action(command, &seeds, compiler)?;
++            let Some(sources) = self.source_seeds(command, &seeds)? else {
++                self.bypass("unidentified-source-input");
++                return self.fresh(command, seeds);
++            };
+             let validation_start = Instant::now();
+             let candidate = match self.previous.lookup(&key, view) {
+                 Ok(value) => value,
+@@ -259,14 +346,20 @@ impl Discovery {
+             );
+             self.scans.fetch_add(1, Ordering::Relaxed);
+             let (dependencies, mut trace) =
+-                match retrieve_c_dependency_paths_observed(command, seeds.clone(), view.clone()) {
++                match retrieve_c_dependency_paths_observed(command, sources, view.clone()) {
+                     Ok(value) => value,
+                     Err(_) => {
+                         self.bypass("observation-error");
+                         return self.fresh(command, seeds);
+                     }
+                 };
+-            if let Err(reason) = self.policy.lock().unwrap().trace(view, &trace) {
++            let dependencies = with_seeds(seeds, dependencies);
++            if let Err(reason) =
++                self.policy
++                    .lock()
++                    .unwrap()
++                    .trace_command(view, &trace, command, &self.wrappers)
++            {
+                 self.bypass(reason);
+                 return Ok(dependencies);
+             }
+@@ -425,6 +518,7 @@ mod tests {
+         }
+         fn write(&self, name: &str, bytes: &str) -> PathBuf {
+             let path = self.cwd().join(name);
++            fs::create_dir_all(path.parent().unwrap()).unwrap();
+             fs::write(&path, bytes).unwrap();
+             path
+         }
+@@ -608,6 +702,61 @@ mod tests {
+         assert_eq!(context.report().candidate_mismatches, 0);
+     }
+ 
++    #[test]
++    fn conservative_inputs_are_leaves_and_forced_headers_are_sources() {
++        let fixture = Fixture::new();
++        let main = fixture.write("main.c", "#if PROBE(\"marker.h\")\n#endif\n");
++        let marker = fixture.write("marker.h", "not c");
++        let manifest = fixture.write(
++            "build.ninja",
++            "rule cc\n  command = cc -DPROBE=__has_include -c main.c\n",
++        );
++        let config = fixture.write("headers/config.h", "#include \"nested.h\"\n");
++        let nested = fixture.write("headers/nested.h", "int value;\n");
++        let command = shell_words::join([
++            "cc".into(),
++            "-DPROBE=__has_include".into(),
++            format!("-I{}", fixture.cwd().join("headers").display()),
++            "-include".into(),
++            "config.h".into(),
++            "-c".into(),
++            "main.c".into(),
++        ]);
++        let seeds = vec![main.clone(), manifest.clone(), config.clone()];
++        let context = fixture.context(Mode::Record);
++        let paths = context
++            .discover_resolved(
++                &command,
++                seeds.clone(),
++                &[],
++                Some(Path::new(
++                    "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-cc/bin/cc",
++                )),
++            )
++            .unwrap();
++        assert_eq!(
++            HashSet::from_iter(paths),
++            HashSet::from([main, manifest, config, nested, marker])
++        );
++        assert_eq!(context.report().recorded_actions, 1);
++        context.finish();
++        drop(context);
++        fixture.write("build.ninja", "different conservative input bytes\n");
++        let context = fixture.context(Mode::Record);
++        context
++            .discover_resolved(
++                &command,
++                seeds,
++                &[],
++                Some(Path::new(
++                    "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-cc/bin/cc",
++                )),
++            )
++            .unwrap();
++        assert_eq!(context.report().validated_candidates, 1);
++        assert_eq!(context.report().candidate_mismatches, 0);
++    }
++
+     #[test]
+     fn exhausted_capture_budget_keeps_fresh_results() {
+         let fixture = Fixture::new();
+diff --git a/crates/nix-ninja/src/discovery_policy.rs b/crates/nix-ninja/src/discovery_policy.rs
+index 2ad4cea..9ba15ff 100644
+--- a/crates/nix-ninja/src/discovery_policy.rs
++++ b/crates/nix-ninja/src/discovery_policy.rs
+@@ -1,9 +1,10 @@
++use deps_infer::c_queries::{self, Aliases, Facts, DIRECTIVE, LITERAL};
++use deps_infer::c_source::Source;
+ use deps_infer::observations::{DiscoveryTrace, ReadView};
+ use n2::canon;
+-use regex::Regex;
+ use std::collections::{BTreeMap, HashMap, HashSet};
+ use std::path::{Path, PathBuf};
+-use std::sync::LazyLock;
++use std::sync::Arc;
+ 
+ type Check<T> = Result<T, &'static str>;
+ 
+@@ -207,78 +208,13 @@ pub fn command(action: &CommandInputs<'_>, view: &ReadView) -> Check<Policy> {
+     Ok(Policy { trace })
+ }
+ 
+-static DIRECTIVE: LazyLock<Regex> =
+-    LazyLock::new(|| Regex::new(r"^\s*#\s*([a-zA-Z_][a-zA-Z_0-9]*)").unwrap());
+-static LITERAL: LazyLock<Regex> =
+-    LazyLock::new(|| Regex::new(r##"^\s*#\s*(include|embed)\s*("[^"\n]+"|<[^>\n]+>)"##).unwrap());
+-static QUERY: LazyLock<Regex> = LazyLock::new(|| {
+-    Regex::new(r##"\b__has_(include|embed)\s*\(\s*("[^"\n]+"|<[^>\n]+>)\s*\)"##).unwrap()
+-});
+-static QUERY_START: LazyLock<Regex> =
+-    LazyLock::new(|| Regex::new(r"\b__has_(include|embed)\s*\(").unwrap());
+-static QUERY_NAME: LazyLock<Regex> =
+-    LazyLock::new(|| Regex::new(r"\b__has_(include|embed)\b").unwrap());
+-static FEATURE_DIRECTIVE: LazyLock<Regex> =
+-    LazyLock::new(|| Regex::new(r"(?m)^\s*#\s*ifn?def\s+__has_(?:include|embed)\b").unwrap());
+-static FEATURE_CHECK: LazyLock<Regex> = LazyLock::new(|| {
+-    Regex::new(r"\bdefined\s*(?:\(\s*__has_(?:include|embed)\s*\)|\s+__has_(?:include|embed)\b)")
+-        .unwrap()
+-});
+-
+-fn directive_prefix(prefix: &str) -> bool {
+-    prefix.trim().is_empty() || prefix.contains("/*") || prefix.contains("*/")
++struct Parsed {
++    source: Source,
++    facts: Facts,
+ }
+ 
+-fn directive_digraph(line: &str) -> bool {
+-    line.match_indices("%:")
+-        .any(|(index, _)| directive_prefix(&line[..index]))
+-}
+-
+-fn continued_dependency(text: &str) -> bool {
+-    let mut joined = String::new();
+-    let mut active = false;
+-    for line in text.lines() {
+-        if let Some(prefix) = line.trim_end().strip_suffix('\\') {
+-            joined.push_str(prefix);
+-            active = true;
+-            continue;
+-        }
+-        if active {
+-            joined.push_str(line);
+-            let dependency = joined.match_indices('#').any(|(index, _)| {
+-                DIRECTIVE
+-                    .captures(&joined[index..])
+-                    .is_some_and(|directive| {
+-                        matches!(
+-                            &directive[1],
+-                            "include" | "embed" | "include_next" | "import"
+-                        )
+-                    })
+-            });
+-            let condition = DIRECTIVE
+-                .captures(&joined)
+-                .is_some_and(|directive| matches!(&directive[1], "if" | "elif"));
+-            let searches = if condition {
+-                FEATURE_CHECK.replace_all(&joined, "")
+-            } else {
+-                joined.as_str().into()
+-            };
+-            if dependency
+-                || directive_digraph(&joined)
+-                || searches.contains("__has_include")
+-                || searches.contains("__has_embed")
+-            {
+-                return true;
+-            }
+-            joined.clear();
+-            active = false;
+-        }
+-    }
+-    false
+-}
+-
+-fn source(bytes: &[u8]) -> Check<()> {
+-    let text = std::str::from_utf8(bytes).map_err(|_| "non-utf8-source")?;
++fn parse(bytes: &[u8]) -> Check<Parsed> {
++    std::str::from_utf8(bytes).map_err(|_| "non-utf8-source")?;
+     if bytes
+         .iter()
+         .enumerate()
+@@ -286,119 +222,160 @@ fn source(bytes: &[u8]) -> Check<()> {
+     {
+         return Err("unsupported-line-ending");
+     }
+-    if continued_dependency(text) {
+-        return Err("continued-dependency");
+-    }
+     if bytes
+         .windows(3)
+         .any(|part| part.starts_with(b"??") && b"()<>/='!-".contains(&part[2]))
+-        || text.lines().any(directive_digraph)
+     {
+         return Err("unmodeled-source-transform");
+     }
+-    if text.contains("__has_include_next") {
+-        return Err("include-next");
++    let source = Source::new(bytes);
++    if !source.complete {
++        return Err("unmodeled-source-lexing");
+     }
+-    let mut literals = HashSet::new();
+-    for line in text.lines() {
+-        if unmodeled_directive(line) {
+-            return Err("unmodeled-directive-spelling");
+-        }
+-        let directive = DIRECTIVE.captures(line);
+-        if let Some(directive) = directive {
+-            match directive.get(1).unwrap().as_str() {
+-                "include" | "embed" => {
+-                    let literal = LITERAL.captures(line).ok_or("computed-dependency")?;
+-                    let name = &literal[2];
+-                    if name[1..name.len() - 1].contains(['"', '>']) {
+-                        return Err("unmodeled-header-name");
+-                    }
+-                    literals.insert((literal[1].to_owned(), literal[2].to_owned()));
+-                }
+-                "include_next" | "import" => return Err("unsupported-directive"),
+-                word if line.trim_end().ends_with('\\')
+-                    && (word.starts_with("inc")
+-                        || word.starts_with("emb")
+-                        || word.starts_with("imp")) =>
+-                {
+-                    return Err("continued-directive")
+-                }
+-                "pragma" if line.contains("pch") => return Err("unsupported-preprocessor-mode"),
+-                _ => {}
+-            }
+-        }
+-    }
+-    let queries: Vec<_> = QUERY.captures_iter(text).collect();
+-    let expressions = FEATURE_CHECK.replace_all(text, "");
+-    let expressions = FEATURE_DIRECTIVE.replace_all(&expressions, "");
+-    if queries.len() != QUERY_START.find_iter(text).count()
+-        || queries.len() != QUERY_NAME.find_iter(&expressions).count()
++    if source
++        .text
++        .match_indices("%:")
++        .any(|(index, _)| source.is_code(index))
+     {
+-        return Err("computed-query");
++        return Err("unmodeled-source-transform");
+     }
+-    for query in queries {
+-        let name = &query[2];
+-        if name[1..name.len() - 1].contains(['"', '>']) {
+-            return Err("unmodeled-header-name");
++    for (offset, line) in source.lines() {
++        let Some(hash) = line
++            .find('#')
++            .filter(|index| source.is_code(offset + index))
++        else {
++            continue;
++        };
++        if !line[..hash].trim().is_empty() {
++            continue;
++        }
++        if line[hash + 1..].trim().is_empty() {
++            continue;
+         }
+-        if &query[1] == "embed" && !literals.contains(&(query[1].to_owned(), query[2].to_owned())) {
+-            return Err("unobserved-existence-query");
++        let directive = DIRECTIVE.captures(line).ok_or("unsupported-directive")?;
++        match &directive[1] {
++            "include" | "embed" => {
++                let literal = LITERAL.captures(line).ok_or("computed-dependency")?;
++                let name = &literal[2];
++                if name[1..name.len() - 1].contains(['"', '>', '\\']) {
++                    return Err("unmodeled-header-name");
++                }
++            }
++            "include_next" | "import" => return Err("unsupported-directive"),
++            "pragma" if line.contains("pch") => return Err("unsupported-preprocessor-mode"),
++            _ => {}
+         }
+     }
+-    Ok(())
++    let facts = Facts::new(&source);
++    Ok(Parsed { source, facts })
+ }
+ 
+-fn unmodeled_directive(line: &str) -> bool {
+-    line.match_indices('#').any(|(index, _)| {
+-        let prefix = &line[..index];
+-        if (prefix.trim().is_empty() && DIRECTIVE.is_match(&line[index..]))
+-            || (prefix.trim_start().starts_with('*') && !line.contains("*/"))
+-        {
+-            return false;
+-        }
+-        directive_prefix(prefix)
+-            && ["include", "embed", "import"]
+-                .iter()
+-                .any(|word| line[index..].contains(word))
+-    })
++#[cfg(test)]
++fn source(bytes: &[u8]) -> Check<()> {
++    let parsed = parse(bytes)?;
++    let aliases = Aliases::new(&parsed.facts.definitions)?;
++    aliases.check_source(&parsed.source, &parsed.facts)
+ }
+ 
+ #[derive(Default)]
+ pub struct FilePolicy {
+-    checked: HashMap<PathBuf, Check<()>>,
++    sources: HashMap<PathBuf, Check<Arc<Parsed>>>,
++    failures: BTreeMap<String, &'static str>,
++    retained_bytes: usize,
+ }
+ 
+ impl FilePolicy {
++    #[cfg(test)]
+     pub fn trace(&mut self, view: &ReadView, trace: &DiscoveryTrace) -> Check<()> {
++        self.trace_command(view, trace, "", &BTreeMap::new())
++    }
++
++    pub fn trace_command(
++        &mut self,
++        view: &ReadView,
++        trace: &DiscoveryTrace,
++        command: &str,
++        wrappers: &BTreeMap<String, String>,
++    ) -> Check<()> {
+         let mut result = Ok(());
+         for (path, target) in &trace.resolutions {
+             if target.is_some() && !view.is_file(path).unwrap_or(false) {
+                 result = Err("nonregular-discovery-input");
+             }
+         }
++        let command_definitions = c_queries::command_definitions(command)?;
++        let mut definitions = command_definitions.clone();
++        let mut parsed = Vec::new();
+         for path in trace.files.keys() {
+-            let checked = self.checked.entry(path.clone()).or_insert_with(|| {
+-                let bytes = view.bytes(path).map_err(|_| "unobservable-source")?;
+-                source(&bytes)
+-            });
+-            if result.is_ok() {
+-                result = *checked;
++            if !self.sources.contains_key(path) {
++                let value = (|| {
++                    let bytes = view.bytes(path).map_err(|_| "unobservable-source")?;
++                    let parsed = parse(&bytes)?;
++                    let size = parsed
++                        .source
++                        .estimated_bytes()
++                        .saturating_add(parsed.facts.estimated_bytes());
++                    if self.retained_bytes.saturating_add(size) > 128 * 1024 * 1024 {
++                        return Err("source-policy-budget");
++                    }
++                    self.retained_bytes += size;
++                    Ok(Arc::new(parsed))
++                })();
++                self.sources.insert(path.clone(), value);
++            }
++            match &self.sources[path] {
++                Ok(value) => {
++                    definitions.extend(value.facts.definitions.iter().cloned());
++                    parsed.push((path, value.clone()));
++                }
++                Err(reason) => {
++                    if result.is_ok() {
++                        result = Err(*reason);
++                    }
++                    self.failure(path, reason);
++                }
++            }
++        }
++        let mut wrapped = Vec::new();
++        for (key, value) in wrappers {
++            if key.starts_with("NIX_CFLAGS_COMPILE") {
++                wrapped.extend(c_queries::command_definitions(value)?);
++            }
++        }
++        definitions.extend(wrapped.iter().cloned());
++        let aliases = Aliases::new(&definitions)?;
++        aliases.check_definitions(&command_definitions)?;
++        aliases.check_definitions(&wrapped)?;
++        if wrapped.iter().any(|definition| {
++            aliases.contains(&definition.name)
++                || definition
++                    .references
++                    .iter()
++                    .any(|name| aliases.contains(name) || name == "__has_embed")
++        }) {
++            return Err("wrapper-query-alias");
++        }
++        for (path, parsed) in parsed {
++            if let Err(reason) = aliases.check_source(&parsed.source, &parsed.facts) {
++                if result.is_ok() {
++                    result = Err(reason);
++                }
++                self.failure(path, reason);
+             }
+         }
+         result
+     }
+ 
+-    pub fn failures(&self) -> BTreeMap<String, &'static str> {
+-        let mut failures = BTreeMap::new();
+-        for (path, status) in &self.checked {
+-            if let Err(reason) = status {
+-                failures.insert(path.to_string_lossy().into_owned(), *reason);
+-                if failures.len() > 32 {
+-                    failures.pop_last();
+-                }
+-            }
++    fn failure(&mut self, path: &Path, reason: &'static str) {
++        self.failures
++            .insert(path.to_string_lossy().into_owned(), reason);
++        if self.failures.len() > 32 {
++            self.failures.pop_last();
+         }
+-        failures
++    }
++
++    pub fn failures(&self) -> BTreeMap<String, &'static str> {
++        self.failures.clone()
+     }
+ }
+ 
+@@ -522,12 +499,8 @@ mod tests {
+             "#include_next <value.h>\n",
+             "#import \"value.h\"\n",
+             "#embed RESOURCE\n",
+-            "#include /* comment */ \"value.h\"\n",
+-            "/* comment */ #include \"value.h\"\n",
+-            "#define QUERY __has_include\n#if QUERY(\"probe.h\")\n#endif\n",
+             "#if __has_include(\"odd>name.h\")\n#endif\n",
+             "#if __has_include(PICK_HEADER)\n#endif\n",
+-            "#inc\\\nlude \"value.h\"\n",
+             "%:include \"value.h\"\n",
+         ] {
+             assert!(source(text.as_bytes()).is_err(), "{text}");
+@@ -549,7 +522,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn continued_dependencies_and_queries_cannot_be_recorded() {
++    fn literal_splices_and_comment_closures_are_modeled() {
+         for text in [
+             "#\\\ninclude \"value.h\"\n",
+             "#i\\\nnclude \"value.h\"\n",
+@@ -557,55 +530,51 @@ mod tests {
+             "#i\\   \nnclude \"value.h\"\n",
+             "# \\\r\n embed \"value.bin\"\n",
+             "#if __has_\\\ninclude(\"value.h\")\n#endif\n",
+-            "#if __ha\\\ns_embed(\"value.bin\")\n#endif\n",
+-            "#define QUERY(x) __has_\\\ninclude(x)\n",
+             "#define QUERY __has_\\\ninclude\n#if QUERY(\"probe.h\")\n#endif\n",
++            "/*\n * text */ #include \"value.h\"\n",
++            "/*\n * # example */ #include \"value.h\"\n",
++            "/*\n * text *\\\n/ #i\\\nnclude \"value.h\"\n",
++            "#include /* comment */ \"value.h\"\n",
++            "#/* comment\n*/include \"value.h\"\n",
++            "# ifndef assert /* prior #include <assert.h> */\n#endif\n",
+         ] {
+-            assert_eq!(
+-                source(text.as_bytes()),
+-                Err("continued-dependency"),
+-                "{text}"
+-            );
++            let fixture = Fixture::new();
++            let main = fixture.write("main.c", text);
++            fixture.write("value.h", "int value;\n");
++            fixture.write("value.bin", "data");
++            fixture.write("probe.h", "not c");
++            let view = Arc::new(ReadView::new(&fixture.0, &fixture.0).unwrap());
++            let (_, trace) =
++                retrieve_c_dependency_paths_observed("cc", vec![main], view.clone()).unwrap();
++            assert_eq!(FilePolicy::default().trace(&view, &trace), Ok(()), "{text}");
+         }
+-        assert!(source(
+-            concat!(
+-                "#define VALUE(x) \\\n",
+-                "    ((x) + 1)\n#include \"value.h\"\n"
+-            )
+-            .as_bytes()
+-        )
+-        .is_ok());
++        assert_eq!(
++            source(b"#define QUERY(x) __has_\\\ninclude(x)\n"),
++            Err("computed-query-alias")
++        );
+     }
+ 
+     #[test]
+-    fn unscanned_continued_headers_are_rejected_by_the_trace_policy() {
++    fn continued_literal_headers_are_present_in_recorded_results() {
+         let fixture = Fixture::new();
+         let main = fixture.write("main.c", "#\\\ninclude \"value.h\"\nint value = VALUE;\n");
+         let header = fixture.write("value.h", "#define VALUE 7\n");
+         let view = Arc::new(ReadView::new(&fixture.0, &fixture.0).unwrap());
+         let (dependencies, trace) =
+             retrieve_c_dependency_paths_observed("cc", vec![main], view.clone()).unwrap();
+-        assert!(!dependencies.contains(&header));
+-        assert_eq!(
+-            FilePolicy::default().trace(&view, &trace),
+-            Err("continued-dependency")
+-        );
++        assert!(dependencies.contains(&header));
++        assert_eq!(FilePolicy::default().trace(&view, &trace), Ok(()));
+     }
+ 
+     #[test]
+-    fn starred_examples_are_text_but_comment_closures_still_bypass() {
++    fn comment_examples_are_ignored_and_raw_strings_stay_opaque() {
+         assert!(source(b"/*\n *   #include \"xxhash.h\"\n */\nint value;\n").is_ok());
+-        for text in [
+-            "/*\n * text */ #include \"value.h\"\n",
+-            "/*\n * # example */ #include \"value.h\"\n",
+-            "/*\n * text *\\\n/ #i\\\nnclude \"value.h\"\n",
+-        ] {
+-            assert!(source(text.as_bytes()).is_err(), "{text}");
+-        }
++        assert!(source(b"auto text = R\"doc(\n#include COMPUTED\n)doc\";\n").is_ok());
+     }
+ 
+     #[test]
+     fn ordinary_text_is_not_a_dependency_directive() {
++        assert!(source(b"#\n# /* null directive */\n").is_ok());
+         for text in [
+             "const char *pattern = \"%1%: %2%\";\n",
+             "const char *question = \"why???\";\n",
+@@ -627,7 +596,6 @@ mod tests {
+     fn directives_after_comment_closures_and_spliced_digraphs_bypass() {
+         for text in [
+             "/* comment */ %:include \"value.h\"\n",
+-            "/*\n# example */ #include \"value.h\"\n",
+             "%\\\n:include \"value.h\"\n",
+             "/*\n# example *\\\n/ %\\\n:include \"value.h\"\n",
+             "#include \"one.h\"\r#include \"two.h\"\r",
+@@ -636,6 +604,39 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn alias_policy_is_scoped_to_each_trace_and_effective_command() {
++        let fixture = Fixture::new();
++        let common = fixture.write("common.h", "#if QUERY(PICK)\n#endif\n");
++        let alias = fixture.write("alias.h", "#define QUERY __has_include\n");
++        let main = fixture.write("main.c", "#if QUERY(\"marker.h\")\n#endif\n");
++        let view = Arc::new(ReadView::new(&fixture.0, &fixture.0).unwrap());
++        let (_, first) =
++            retrieve_c_dependency_paths_observed("cc", vec![common.clone()], view.clone()).unwrap();
++        let (_, second) =
++            retrieve_c_dependency_paths_observed("cc", vec![common, alias], view.clone()).unwrap();
++        let mut policy = FilePolicy::default();
++        assert_eq!(policy.trace(&view, &first), Ok(()));
++        assert_eq!(policy.trace(&view, &second), Err("computed-query"));
++        assert!(policy
++            .failures()
++            .keys()
++            .any(|path| path.ends_with("common.h")));
++        let command = "cc -DQUERY=__has_include";
++        let (_, trace) =
++            retrieve_c_dependency_paths_observed(command, vec![main], view.clone()).unwrap();
++        assert_eq!(
++            policy.trace_command(&view, &trace, command, &BTreeMap::new()),
++            Ok(())
++        );
++        let wrappers =
++            BTreeMap::from([("NIX_CFLAGS_COMPILE".into(), "-DQUERY=__has_include".into())]);
++        assert_eq!(
++            policy.trace_command(&view, &trace, "cc", &wrappers),
++            Err("wrapper-query-alias")
++        );
++    }
++
+     #[test]
+     fn failure_examples_are_bounded_and_sorted() {
+         let fixture = Fixture::new();
