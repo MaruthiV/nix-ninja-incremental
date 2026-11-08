@@ -39,6 +39,12 @@ jobs:
         run: python3 tools/dev.py runtime
       - name: Environment manifest
         run: python3 tools/dev.py info
+      - name: Pinned build-trace reset probe
+        if: inputs.kind == 'cold'
+        run: >-
+          python3 tools/dev.py exec -- nix-shell --impure
+          --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).nixWorkload.shell'
+          --run 'python3 /workspace/tests/cold_trace_checks.py --disposable-store daemon'
       - name: Paired end-to-end builds
         run: >-
           python3 tools/dev.py exec -- nix-shell --impure
@@ -55,6 +61,7 @@ jobs:
             results/setup/
             results/workloads/
             results/evaluation/
+            results/lifecycle/
           if-no-files-found: warn
           retention-days: 7
       - name: Stop project daemon

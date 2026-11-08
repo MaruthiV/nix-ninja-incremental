@@ -1,6 +1,7 @@
 import argparse
 from contextlib import ExitStack
 from functools import partial
+import gzip
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ import time
 import evaluate_planning as planning
 from planning import discovery_report
 import realize
+from store_state import build_traces, trace_deletion_set
 import workloads
 
 
@@ -77,16 +79,34 @@ def paired_builds(binary, workload, view, destination, report, rounds, seed, col
             return set(paths)
 
         def reset_store(name, protected):
+            start = time.monotonic_ns()
             before = inventory(name + "-before")
             selected = collection_set(protected, before)
+            traces_before = build_traces()
+            trace_keys = trace_deletion_set(protected_traces, traces_before, protected, before)
+            (destination / f"{name}-traces-before.json").write_text(json.dumps(traces_before, indent=2) + "\n")
+            if trace_keys:
+                realize.invoke(["nix", "store", "build-trace", "delete", "--store", "local", *trace_keys],
+                               env, destination, name + "-delete-traces", report)
             if selected:
                 realize.invoke(["nix", "store", "delete", "--store", "daemon", *selected],
                                env, destination, name + "-delete", report)
             after = inventory(name + "-after")
+            traces_after = build_traces()
+            (destination / f"{name}-traces-after.json").write_text(json.dumps(traces_after, indent=2) + "\n")
             report.setdefault("store_resets", []).append({"name": name, "selected": selected,
-                                                          "protected_count": len(protected), "after_count": len(after)})
-            if after != protected:
-                raise RuntimeError("store reset did not restore the exact protected inventory")
+                                                          "trace_keys": trace_keys, "protected_count": len(protected),
+                                                          "after_count": len(after), "elapsed_ns": time.monotonic_ns() - start})
+            if after != protected or traces_after != protected_traces:
+                raise RuntimeError("store reset did not restore the exact protected inventory and build-trace map")
+
+        def retain_artifact(name, path):
+            start = time.monotonic_ns()
+            target = destination / f"{name}.artifact.gz"
+            with path.open("rb") as source, target.open("xb") as output:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=output, compresslevel=1, mtime=0) as archive:
+                    shutil.copyfileobj(source, archive, length=1024 * 1024)
+            return {"saved_artifact": target.name, "artifact_copy_ns": time.monotonic_ns() - start}
 
         def invoke(name, mode, cache, kind, case, round_number, tool=None):
             argv = [str(binary), "-C", str(build), "-j4", "--input-view", str(view.marker),
@@ -112,6 +132,16 @@ def paired_builds(binary, workload, view, destination, report, rounds, seed, col
                 target = build / workload["target"]
                 row.update(artifact=str(target.resolve(strict=True)), artifact_sha256=realize.digest(target))
                 probe(name, target)
+                if cold:
+                    row.update(retain_artifact(name, target))
+                    realize.invoke(["nix", "path-info", "--all", "--json", "--store", "daemon"],
+                                   env, destination, name + "-store-info", report)
+                    row["object_probes"] = []
+                    for path in sorted(inventory(name + "-artifact-inventory")):
+                        path = Path(path)
+                        if path.name.endswith("-installable-derived-path.cc.o") and path.is_file():
+                            artifact = retain_artifact(name + "-object-probe-" + path.name[:32], path)
+                            row["object_probes"].append({"path": str(path), "sha256": realize.digest(path), **artifact})
             if edits.snapshot() != row["input_state"]:
                 raise RuntimeError(f"build modified the owned source: {name}")
             return row
@@ -140,7 +170,13 @@ def paired_builds(binary, workload, view, destination, report, rounds, seed, col
                     invoke(f"prewarm-{case}", "off", state_root / "prewarm", "store-warmup", case, -1)
             edits.reset()
             restore_build()
+            start = time.monotonic_ns()
             protected = inventory("protected-inventory")
+            protected_traces = build_traces() if cold else None
+            if cold:
+                (destination / "protected-build-traces.json").write_text(json.dumps(protected_traces, indent=2) + "\n")
+                report["store_reset_contract"] = "valid paths and pinned CA build-trace map; supported APIs only"
+            report["store_state_setup_ns"] = time.monotonic_ns() - start
             report["protected_inventory_sha256"] = hashlib.sha256("\n".join(sorted(protected)).encode()).hexdigest()
             report["protected_inventory_count"] = len(protected)
             rng = random.Random(seed)

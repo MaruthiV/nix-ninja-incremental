@@ -1,5 +1,7 @@
 import argparse
 from collections import defaultdict
+import gzip
+import hashlib
 import json
 from pathlib import Path
 import random
@@ -8,6 +10,7 @@ import statistics
 import evaluate_planning
 from planning import discovery_report
 import realize
+from store_state import trace_deletion_set
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,6 +81,11 @@ def verified_rows(path, data, kind):
             expected = "2" if data["workload"]["name"] == "nix" else "zstd roundtrip ok"
             require((path.parent / f"{probe_name}.stdout").read_text().strip() == expected,
                     f"functional probe output differs: {name}")
+            if kind == "cold":
+                require(row["saved_artifact"] == f"{name}.artifact.gz", "unexpected retained cold artifact")
+                with gzip.open(path.parent / row["saved_artifact"], "rb") as artifact:
+                    require(hashlib.file_digest(artifact, "sha256").hexdigest() == row["artifact_sha256"],
+                            f"retained cold artifact bytes differ: {name}")
         rows[name] = row
     return rows
 
@@ -120,6 +128,34 @@ def verified_pair(pair, rows, data, kind):
     return modes
 
 
+def verified_store_resets(path, data):
+    protected = set((path.parent / "protected-inventory.stdout").read_text().splitlines())
+    protected_traces = json.loads((path.parent / "protected-build-traces.json").read_text())
+    names = set()
+    for reset in data["store_resets"]:
+        name = reset["name"]
+        require(Path(name).name == name and name not in names, "duplicate or unsafe cold reset name")
+        names.add(name)
+        before = set((path.parent / f"{name}-before.stdout").read_text().splitlines())
+        after = set((path.parent / f"{name}-after.stdout").read_text().splitlines())
+        require(protected <= before and after == protected and reset["selected"] == sorted(before - protected),
+                "cold store inventories do not prove an exact reset")
+        before_traces = json.loads((path.parent / f"{name}-traces-before.json").read_text())
+        after_traces = json.loads((path.parent / f"{name}-traces-after.json").read_text())
+        require(trace_deletion_set(protected_traces, before_traces, protected, before) == reset["trace_keys"]
+                and after_traces == protected_traces, "cold build-trace maps do not prove an exact reset")
+        if reset["trace_keys"]:
+            command = data["processes"][name + "-delete-traces"]
+            require(command["returncode"] == 0 and command["argv"] == [
+                "nix", "store", "build-trace", "delete", "--store", "local", *reset["trace_keys"]],
+                "cold build traces were not removed with the scoped supported API")
+        if reset["selected"]:
+            command = data["processes"][name + "-delete"]
+            require(command["returncode"] == 0 and command["argv"] == [
+                "nix", "store", "delete", "--store", "daemon", *reset["selected"]],
+                "cold paths were not removed with the scoped supported API")
+
+
 def summarize(inputs, destination, kind, rounds, workload_names, binary_sha256, seed=2027):
     summary = {"schema_version": 1, "stage": "verified paired evaluation summary", "passed": False,
                "kind": kind, "rounds": rounds, "workloads": workload_names, "binary_sha256": binary_sha256,
@@ -152,12 +188,7 @@ def summarize(inputs, destination, kind, rounds, workload_names, binary_sha256, 
                     "evaluation machine, seed or resource limits differ")
             rows = verified_rows(path, data, kind)
             if kind == "cold":
-                protected = set((path.parent / "protected-inventory.stdout").read_text().splitlines())
-                for reset in data["store_resets"]:
-                    before = set((path.parent / f"{reset['name']}-before.stdout").read_text().splitlines())
-                    after = set((path.parent / f"{reset['name']}-after.stdout").read_text().splitlines())
-                    require(protected <= before and after == protected and set(reset["selected"]) == before - protected,
-                            "cold store inventories do not prove an exact reset")
+                verified_store_resets(path, data)
             for pair in data["pairs"]:
                 key = (name, pair["scenario"], pair["round"])
                 require(key in expected and key not in seen, f"unexpected or duplicate pair: {key}")
