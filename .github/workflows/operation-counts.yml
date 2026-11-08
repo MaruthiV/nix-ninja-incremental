@@ -1,0 +1,55 @@
+name: planner operation counts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: operation-counts-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        workload: [nix, zstd]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Isolated diagnostic source
+        run: python3 tools/operation_profile.py prepare
+      - name: Frozen helper implementation
+        run: python3 tools/variants.py prepare recording
+      - name: Isolated Nix daemon
+        run: python3 tools/dev.py up
+      - name: Pinned Nix runtime
+        run: python3 tools/dev.py runtime
+      - name: Environment manifest
+        run: python3 tools/dev.py info
+      - name: Matched planner API count diagnostic
+        run: >-
+          python3 tools/dev.py exec -- nix-shell --impure
+          --expr '(import /workspace/environment/baseline.nix { source = /workspace/.work/nix-ninja-recording; cliRuntime = true; }).nixWorkload.shell'
+          --run 'python3 /workspace/tools/evaluate_operations.py ${{ matrix.workload }}'
+      - name: Raw count verification
+        run: >-
+          python3 tools/operation_summary.py results/evaluation --workload ${{ matrix.workload }}
+          --output results/evaluation/verified-operations.json
+      - name: Raw operation-count records
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: operation-counts-${{ matrix.workload }}-${{ github.run_id }}
+          path: |
+            results/setup/
+            results/workloads/
+            results/evaluation/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Stop project daemon
+        if: always()
+        run: python3 tools/dev.py stop
